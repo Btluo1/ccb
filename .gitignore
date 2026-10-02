@@ -23,9 +23,22 @@ yarn-error.log*
 .kimi*
 .fetch-*
 .qoder-*
+.index-online*
+.verify*.txt
+.install*.txt
+.start-installer*.txt
+.build-log*.txt
+.test-exit.txt
+.test-output.txt
+.ccb-logs.txt
+.kill-ccb.txt
+.npm-install.txt
+.mock-delay.mjs
+.trae-html-share-packages/
 .*-check*.txt
 .*-log.txt
 qoder-cn-proxy.cmd
+/200
 
 # ---- 服务端与内部材料（不在开源范围，仅本地保留）----
 /src/
