@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data: file:" />
+<title>CCB · AI 编程助手一键配置</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- 登录视图 -->
+  <section id="viewAuth" class="authview" hidden>
+    <div class="authcard">
+      <span class="logo big" aria-hidden="true"><svg viewBox="0 0 128 128"><path d="M85.9 85.9 A31 31 0 1 1 85.9 42.1" fill="none" stroke="#ffffff" stroke-width="15" stroke-linecap="round" /><path d="M56.5 50.5 L68.5 64 L56.5 77.5" fill="none" stroke="#ffffff" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round" /></svg></span>
+      <h1>CCB · AI 编程助手</h1>
+      <p class="auth-sub">登录账号，兑换卡密，一键配置并启动你的 AI 编程客户端</p>
+
+      <div class="authtabs">
+        <button type="button" id="tabLogin" class="on">登录</button>
+        <button type="button" id="tabRegister">注册</button>
+      </div>
+
+      <form id="authForm" novalidate>
+        <label class="afield"><span>用户名</span>
+          <input id="fUser" type="text" autocomplete="username" spellcheck="false" placeholder="2-30 个字符，支持中文" />
+        </label>
+        <label class="afield"><span>密码</span>
+          <input id="fPass" type="password" autocomplete="current-password" placeholder="至少 6 位" />
+        </label>
+        <label class="afield" id="fPass2Row" hidden><span>确认密码</span>
+          <input id="fPass2" type="password" autocomplete="new-password" placeholder="再输入一次密码" />
+        </label>
+        <button class="btn primary mega" id="authBtn" type="submit">登录</button>
+      </form>
+
+      <div class="status" id="authStatus"></div>
+      <p class="authnote">没有账号？切换到「注册」，输入用户名和密码即可创建，<b>无需邮箱</b>。</p>
+    </div>
+  </section>
+
+  <!-- 主视图 -->
+  <div id="viewMain" hidden>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"><svg viewBox="0 0 128 128"><path d="M85.9 85.9 A31 31 0 1 1 85.9 42.1" fill="none" stroke="#ffffff" stroke-width="15" stroke-linecap="round" /><path d="M56.5 50.5 L68.5 64 L56.5 77.5" fill="none" stroke="#ffffff" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round" /></svg></span>
+        <div>
+          <div class="brand-name">CCB <span class="brand-sub">AI 编程助手一键配置</span></div>
+          <div class="brand-meta">服务地址 <code id="endpointChip">code.btluo.com/v1</code></div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span class="userchip" id="userChip" title="查看余额"></span>
+        <button class="ver" id="verChip" type="button" title="检查更新"></button>
+        <button class="btn ghost sm inline" id="checkUpdateBtn" type="button" title="检查是否有新版本">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+          <span id="checkUpdateLabel">检查更新</span>
+        </button>
+        <button class="btn ghost sm" id="logoutBtn" type="button">退出登录</button>
+      </div>
+    </header>
+
+    <!-- 新版本提示横幅：发现新版本时出现，可「稍后」（同一版本不再自动弹出） -->
+    <div class="updatebar" id="updateBar" hidden>
+      <svg class="updatebar-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13"/><path d="M6.5 10.5 12 16l5.5-5.5"/><path d="M4 20h16"/></svg>
+      <div class="updatebar-main">
+        <div class="updatebar-title" id="updateTitle"></div>
+        <div class="updatebar-sub" id="updateSub"></div>
+      </div>
+      <div class="updatebar-progress" id="updateProgress" hidden><i id="updateProgressFill"></i></div>
+      <div class="updatebar-actions">
+        <button class="btn primary sm" id="updateActionBtn" type="button">立即更新</button>
+        <button class="linklike" id="updateManualBtn" type="button" hidden>手动下载</button>
+        <button class="linklike" id="updateCloseBtn" type="button">稍后</button>
+      </div>
+    </div>
+
+    <main class="layout">
+
+      <!-- Step 1: 账户余额 / 兑换卡 -->
+      <section class="card" id="acctCard">
+        <div class="step-head">
+          <span class="step-no">1</span>
+          <div>
+            <div class="step-title">账户余额</div>
+            <div class="step-desc">全部模型按官方定价 2 折计费，按 token 用量从余额扣费；余额不足时，在下方输入兑换卡卡密即可充值，立即生效。</div>
+          </div>
+        </div>
+        <div class="hintbar" id="balanceHint" hidden></div>
+        <div class="balancerow">
+          <div class="balance">
+            <span class="balance-label">当前余额</span>
+            <span class="balance-value" id="balanceValue">$0.00</span>
+          </div>
+          <div class="redeembox">
+            <input id="redeemInput" type="text" placeholder="输入兑换卡卡密" autocomplete="off" spellcheck="false" />
+            <button class="btn primary" id="redeemBtn" type="button">兑换</button>
+            <button class="btn ghost" id="buyCardBtn" type="button" title="代理商购买余额兑换卡">购买兑换卡</button>
+          </div>
+        </div>
+        <div class="status" id="redeemStatus"></div>
+
+        <details class="models-box" id="modelsBox" style="display:none">
+          <summary>可用模型（共 <span id="modelCnt2">0</span> 个 · 全部自动配置）</summary>
+          <div class="chips" id="modelChips"></div>
+        </details>
+      </section>
+
+      <!-- Step 2: 选择客户端并一键配置 -->
+      <section class="card" id="step2">
+        <div class="step-head">
+          <span class="step-no">2</span>
+          <div>
+            <div class="step-title">选择要配置的客户端</div>
+            <div class="step-desc">选中一个客户端后点击一键配置：自动写入全部模型，并自动启动（运行中的会自动重启），打开即可使用。每次配置一个，完成后可再选下一个。</div>
+          </div>
+          <div class="step-tools">
+            <button class="btn ghost sm" id="rescanBtn" type="button">重新检测</button>
+          </div>
+        </div>
+
+        <div class="hintbar" id="selectHint" hidden></div>
+
+        <div class="client-grid" id="clientGrid"></div>
+
+        <button class="btn primary mega" id="applyAllBtn" type="button">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+          一键配置并启动
+        </button>
+
+        <div class="all-summary" id="allSummary" style="display:none"></div>
+        <div id="panel"><div class="empty"><div>点击客户端卡片上的「详情」查看配置详情、日志与回滚。</div></div></div>
+
+        <details class="adv" id="advBox">
+          <summary>高级设置（一般无需修改）</summary>
+          <div class="adv-grid">
+            <label>账号服务地址<input id="advAccountBase" type="text" spellcheck="false" /></label>
+            <label>OpenAI 兼容地址<input id="advApiBase" type="text" spellcheck="false" /></label>
+            <label>Anthropic 兼容地址<input id="advAnthropicBase" type="text" spellcheck="false" /></label>
+          </div>
+        </details>
+      </section>
+
+      <!-- 遇到问题？常见问题文档：内置在页面最底部，按「现象 → 解决办法」自查；
+           顶部搜索框按关键词过滤，页脚「常见问题」可直接跳转到这里 -->
+      <section class="card helpcard" id="helpCard">
+        <div class="step-head">
+          <span class="step-no help">?</span>
+          <div>
+            <div class="step-title">遇到问题？先在这里找答案</div>
+            <div class="step-desc">下面是使用中最常遇到的问题和解决办法，输入关键词可快速筛选。没找到的话，点页脚「使用引导」重看一遍操作步骤。</div>
+          </div>
+        </div>
+        <div class="help-search">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <input id="helpSearch" type="text" placeholder="搜索关键词，例如：登录 / 余额 / 路径 / 回滚" autocomplete="off" spellcheck="false" />
+          <button class="linklike" id="helpClear" type="button" hidden>清除</button>
+        </div>
+        <div class="help-list" id="helpList"></div>
+        <div class="help-empty" id="helpEmpty" hidden>没有找到相关问题，换个关键词试试；或点页脚「使用引导」重看操作步骤。</div>
+        <div class="help-more">更多说明与最新文档：<button class="linklike" id="helpSiteBtn" type="button">官网 ccb.btluo.com</button></div>
+      </section>
+
+    </main>
+
+    <footer class="foot">
+      <span>配置写入前自动备份（*.bak），可随时回滚</span>
+      <span class="foot-actions">
+        <button class="linklike" id="helpBtn" type="button">常见问题</button>
+        <button class="linklike" id="guideBtn" type="button">使用引导</button>
+        <button class="linklike" id="openSiteBtn" type="button">官网 ccb.btluo.com</button>
+      </span>
+    </footer>
+
+  </div>
+
+</div>
+<div id="toast"></div>
+
+<!-- 代理商购买余额兑换卡弹窗：列出淘宝店铺链接，复制后到淘宝 App 打开购买 -->
+<div class="modal-dim" id="buyCardDim" hidden></div>
+<div class="modal-card" id="buyCardModal" role="dialog" aria-labelledby="buyCardTitle" hidden>
+  <div class="modal-head">
+    <h2 id="buyCardTitle">淘宝购买兑换卡</h2>
+    <button class="modal-close" id="buyCardClose" type="button" aria-label="关闭">×</button>
+  </div>
+  <p class="modal-sub">复制链接后在淘宝 App 中打开</p>
+  <div class="shop-item">
+    <div class="shop-top">
+      <span class="shop-name">店1</span>
+      <button class="btn sm ghost btn-copy" data-copy="https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1067865742373" type="button">复制</button>
+    </div>
+    <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1067865742373</div>
+  </div>
+  <div class="shop-item">
+    <div class="shop-top">
+      <span class="shop-name">店2</span>
+      <button class="btn sm ghost btn-copy" data-copy="https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1060900775941" type="button">复制</button>
+    </div>
+    <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1060900775941</div>
+  </div>
+</div>
+
+<!-- 新手引导：首次进入主界面自动弹出，可跳过，完成后不再展示。
+     遮罩不接收点击（pointer-events:none），用户可边看引导边直接操作高亮区域 -->
+<div class="guide-dim" id="guideDim" hidden></div>
+<div class="guide-card" id="guideCard" role="dialog" aria-labelledby="guideTitle" hidden>
+  <div class="guide-head">
+    <span class="guide-progress" id="guideProgress">1 / 3</span>
+    <button class="linklike" id="guideSkip" type="button">跳过引导</button>
+  </div>
+  <h2 id="guideTitle"></h2>
+  <p id="guideText"></p>
+  <div class="guide-actions">
+    <button class="btn ghost" id="guidePrev" type="button">上一步</button>
+    <button class="btn primary" id="guideNext" type="button">下一步</button>
+  </div>
+  <div class="guide-hint">跟着高亮的区域操作即可，左右方向键可翻页</div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

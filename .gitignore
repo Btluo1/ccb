@@ -1,0 +1,53 @@
+# ---- Node / 构建产物 ----
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# ---- 本地环境 / 密钥（绝不入库）----
+.dev.vars*
+.env*
+.r2-token*.txt
+.r2-upload*
+.wrangler/
+
+# ---- 编辑器 / 工具 ----
+.vscode/
+.trae/
+.workbuddy/
+
+# ---- 本地调试与取证产物（仅本地保留）----
+.tmp-*
+.kimi*
+.fetch-*
+.qoder-*
+.*-check*.txt
+.*-log.txt
+qoder-cn-proxy.cmd
+
+# ---- 服务端与内部材料（不在开源范围，仅本地保留）----
+/src/
+/scripts/
+/docs/
+/public/
+/migrations/
+/test/
+/wrangler.jsonc
+/worker-configuration.d.ts
+/package.json
+/package-lock.json
+/vitest.config.mjs
+/AGENTS.md
+
+# ---- desktop/test：只收录正式单测与自带 stub 的 UI 冒烟脚本 ----
+/desktop/test/*
+!/desktop/test/*.test.js
+!/desktop/test/renderer-mitm-smoke.js
+!/desktop/test/renderer-qoder-proxy-smoke.js
+
+# ---- 图片：默认忽略，放行开源端自有资源 ----
+*.png
+!desktop/renderer/icons/*.png
+!desktop/build/*.png

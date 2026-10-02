@@ -1,0 +1,6 @@
+# 开发模式（electron . / npm start）下 electron-updater 的更新源配置。
+# 打包后不使用本文件：electron-builder 会依据 package.json 的 build.publish
+# 在 resources 里生成 app-update.yml。本文件只服务 `npm start` 的联调。
+provider: generic
+url: https://ccb.btluo.com/download
+channel: latest

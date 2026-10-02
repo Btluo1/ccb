@@ -1,0 +1,58 @@
+{
+  "name": "ccb-desktop",
+  "version": "1.0.12",
+  "description": "CCB - AI 编程助手一键配置工具",
+  "main": "electron/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "vitest run",
+    "icons": "electron make-icons.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "^44.4.3",
+    "electron-builder": "^26.15.3",
+    "jsdom": "^28.0.0",
+    "vitest": "^4.1.11"
+  },
+  "build": {
+    "appId": "com.btluo.ccb",
+    "productName": "CCB",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "renderer/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://ccb.btluo.com/download/"
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "artifactName": "ccb-setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "ccb-portable-${version}.${ext}"
+    }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "node-forge": "^1.4.0",
+    "protobufjs": "^8.8.0"
+  }
+}
