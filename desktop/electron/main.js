@@ -2,6 +2,25 @@ const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { parseScriptDispatch, buildScriptArgs } = require('./lib/script-dispatch');
+
+/* ---------- 打包版无窗口子进程脚本派发（必须在其余模块加载/事件注册之前） ----------
+ * 打包后 CCB.exe 忽略文件参数、总是运行自身 main.js，子进程脚本改用
+ * --ccb-script=<lib 下文件名> 标记启动，由这里 require 对应模块后直接返回：
+ * 不建窗口、不注册 IPC、不加载主应用的其余模块。开发模式（electron .）走不到
+ * 这里（spawn 仍按脚本路径直接起）。 */
+const scriptDispatch = parseScriptDispatch(process.argv);
+if (scriptDispatch) {
+	if (scriptDispatch.error) {
+		process.stdout.write(JSON.stringify({ ok: false, error: scriptDispatch.error }));
+		app.exit(1);
+		return;
+	}
+	process.argv = scriptDispatch.argv;
+	require(path.join(__dirname, 'lib', scriptDispatch.name));
+	return;
+}
+
 const { detectClients, getClient, validateCustomPath } = require('./lib/clients');
 const { applyConfig, rollbackConfig, cleanupLegacyKiroEnv, isCursorProxyActive } = require('./lib/writers');
 const cursorproxy = require('./lib/cursorproxy');
@@ -171,7 +190,8 @@ ipcMain.handle('api:redeem', (_e, code) => {
 /* ---------- Qoder CN IDE v10 密钥加密（qoder-secret-helper 子进程） ----------
  * QoderCN 的 safeStorage 密钥从其 userData 的 Local State 派生，主进程无法直接复用，
  * 用自身 exe 起一个无窗口子进程（app.setPath('userData', QoderCN) 后加密）。
- * 开发模式（electron .）与打包后（CCB.exe <script>）都兼容。 */
+ * 开发模式按脚本路径直接起；打包后 CCB.exe 忽略文件参数，用 --ccb-script= 标记
+ * 由 main.js 顶部派发（buildScriptArgs 统一处理两种形态）。 */
 function encryptQoderSecret(plaintext) {
 	return new Promise((resolve) => {
 		if (!plaintext) return resolve(null);
@@ -188,7 +208,7 @@ function encryptQoderSecret(plaintext) {
 			if (!settled) { settled = true; resolve(v); }
 		};
 		try {
-			const child = spawn(process.execPath, [script, 'encrypt', plaintext], {
+			const child = spawn(process.execPath, buildScriptArgs(app.isPackaged, script, 'encrypt', plaintext), {
 				env,
 				stdio: ['ignore', 'pipe', 'ignore'],
 				windowsHide: true,
@@ -245,7 +265,8 @@ function qoderProxyAutostartCmd() {
 	if (process.env.PORTABLE_EXECUTABLE_FILE) return null;
 	const script = path.join(__dirname, 'lib', 'qoder-proxy-runner.js');
 	if (!fs.existsSync(script)) return null;
-	return `"${process.execPath}" "${script}" ${QODER_PROXY_PORT}`;
+	const args = buildScriptArgs(app.isPackaged, script, String(QODER_PROXY_PORT));
+	return `"${process.execPath}" ${args.map((a) => `"${a}"`).join(' ')}`;
 }
 
 function setQoderProxyAutostart(enable) {
@@ -284,6 +305,9 @@ async function ensureQoderProxy(opts = {}) {
 		if (opts.relayBaseUrl) {
 			try { qoderproxy.setRelayBaseUrl(String(opts.relayBaseUrl)); } catch {}
 		}
+		/* 顺手刷新自启动项：老版本打包版写进注册表的是「CCB.exe 脚本路径」坏形态
+		 *（开机拉起带窗口的完整应用而非 runner），借此机会改写成标记派发形态 */
+		setQoderProxyAutostart(true);
 		return { ok: true, mode: 'detached-alive' };
 	}
 	/* 3) 拉起 detached runner（安装版）：spawn 前把 relay 地址落盘，
@@ -296,7 +320,7 @@ async function ensureQoderProxy(opts = {}) {
 		const env = { ...process.env };
 		delete env.ELECTRON_RUN_AS_NODE;
 		try {
-			const child = spawn(process.execPath, [script, String(port)], {
+			const child = spawn(process.execPath, buildScriptArgs(app.isPackaged, script, String(port)), {
 				detached: true, stdio: 'ignore', windowsHide: true, env,
 			});
 			child.unref();

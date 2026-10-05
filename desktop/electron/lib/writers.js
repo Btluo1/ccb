@@ -1191,12 +1191,26 @@ function reapplyQoderCn(client, log) {
 	}
 	if (!saved || !saved.qoderSecretBlob || !Array.isArray(saved.models) || !saved.models.length) return false;
 	const clientDef = client || { id: 'qoder-cn', appDirs: ['QoderCN'] };
-	/* 若 IDE 没清空且条目完好，跳过重写（避免无谓的 id 变更导致选中模型失效） */
+	/* 若 IDE 没清空且条目与持久化参数一致，跳过重写（避免无谓的 id 变更导致选中
+	 * 模型失效）。一致性 = 条目数够 + 每条 baseUrl/provider 与参数一致 + 每条的
+	 * apiKey secret 都在。只看条目数量会漏掉「参数已更新、条目还挂着旧地址」的
+	 * 漂移：曾出现 vscdb 条目仍指向失效的测试隧道而参数已是生产中转，IDE 一直
+	 * 按旧地址生成 custom pool 失败（「自定义模型服务异常」）。 */
 	try {
 		const db = qoderCnStateDb(clientDef);
 		const existing = vscdb.readJson(db, QODER_CN_MODELS_KEY) || [];
 		const ours = existing.filter(isOursQoderCnModel);
-		if (ours.length >= saved.models.length) return true;
+		const wantBase = String(saved.apiBase || '');
+		const wantProvider = saved.qoderProvider || 'custom';
+		let consistent = ours.length >= saved.models.length &&
+			ours.every((m) => String(m.baseUrl || '') === wantBase && String(m.provider || 'custom') === wantProvider);
+		if (consistent) {
+			try {
+				const liveSecrets = new Set(vscdb.listKeys(db, QODER_CN_SECRET_PREFIX + '%'));
+				consistent = ours.every((m) => liveSecrets.has(QODER_CN_SECRET_PREFIX + m.id));
+			} catch { /* secret 清点失败不强制重写，按一致处理 */ }
+		}
+		if (consistent) return true;
 	} catch {}
 	writeQoderCnVscdbModels(clientDef, {
 		apiKey: saved.apiKey,

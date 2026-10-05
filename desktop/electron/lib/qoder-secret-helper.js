@@ -9,8 +9,10 @@
  * safeStorage.encryptString 即用 QoderCN 的密钥加密（与 Qoder IDE 互通）。
  *
  * 用法（由 main.js spawn 调用，不直接 require）：
- *   <CCB.exe> qoder-secret-helper.js encrypt <plaintext>   → stdout: {"ok":true,"b64":"..."}
- *   <CCB.exe> qoder-secret-helper.js decrypt <base64>       → stdout: {"ok":true,"plain":"..."}
+ *   dev：<electron.exe> qoder-secret-helper.js encrypt <plaintext> → stdout: {"ok":true,"b64":"..."}
+ *        <electron.exe> qoder-secret-helper.js decrypt <base64>   → stdout: {"ok":true,"plain":"..."}
+ *   打包：<CCB.exe> --ccb-script=qoder-secret-helper.js encrypt <plaintext>（main.js 顶部派发，
+ *        argv 已规整为 [execPath, 脚本名, mode, arg]，解析位置与 dev 完全一致）
  *
  * 注意：ELECTRON_RUN_AS_NODE 必须未设置（父进程是正常 Electron 应用，继承环境即可）。
  */

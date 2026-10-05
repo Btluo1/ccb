@@ -561,6 +561,11 @@ function handleRequest(req, res, bodyChunks) {
 		fetchUpstream(req, bodyChunks, (err, upRes, body) => {
 			if (err) { res.destroy(); return; }
 			let out = body;
+			/* 排障：落盘最新的 user/status|plan 原始响应，确认 allow_byok 字段位置 */
+			try {
+				fs.writeFileSync(path.join(state.dataDir, 'qoder-user-resp-dump.txt'),
+					`${req.method} ${req.url}\nHTTP ${upRes.statusCode}\n\n${body.toString('utf8').slice(0, 8000)}`);
+			} catch {}
 			try {
 				const j = JSON.parse(body.toString('utf8'));
 				let changed = false;
@@ -634,6 +639,24 @@ function handleRequest(req, res, bodyChunks) {
 			headers['content-length'] = out.length;
 			res.writeHead(200, headers);
 			res.end(out);
+		});
+		return;
+	}
+	/* 排障：dump login/identity 响应（定位 IDE 侧 allowByok 的真实来源） */
+	if (/\/api\/v3\/user\/login/.test(req.url || '') || /\/api\/v2\/service\/migration\/identity/.test(req.url || '')) {
+		fetchUpstream(req, bodyChunks, (err, upRes, body) => {
+			if (err) { res.destroy(); return; }
+			try {
+				fs.writeFileSync(path.join(state.dataDir, 'qoder-login-dump.txt'),
+					`${req.method} ${req.url}\nHTTP ${upRes.statusCode}\n\n${body.toString('utf8').slice(0, 8000)}`);
+			} catch {}
+			const headers = { ...upRes.headers };
+			delete headers['content-encoding'];
+			delete headers['content-length'];
+			delete headers['transfer-encoding'];
+			headers['content-length'] = body.length;
+			res.writeHead(upRes.statusCode || 502, headers);
+			res.end(body);
 		});
 		return;
 	}

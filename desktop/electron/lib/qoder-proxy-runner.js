@@ -6,7 +6,8 @@
  * 127.0.0.1:9183 —— 代理一死，IDE 的 Go 客户端所有请求失败（「连接失败，请
  * 检查您的网络连接或 VPN」）。因此代理必须独立于 CCB 主进程存活：
  *
- *   <CCB.exe> qoder-proxy-runner.js <port>      （完整 Electron，无窗口）
+ *   dev：<electron.exe> qoder-proxy-runner.js <port>          （完整 Electron，无窗口）
+ *   打包：<CCB.exe> --ccb-script=qoder-proxy-runner.js <port>（main.js 顶部派发，argv 已规整）
  *
  * - 以 detached 子进程启动，CCB 关闭后继续运行；pid 写入 ~/.ccb/qoder-proxy.pid
  * - userData 重定向到 ~/.ccb/qoder-proxy-userdata（避免与主应用 / 其他实例冲突）
