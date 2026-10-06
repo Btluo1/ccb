@@ -15,7 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
-const { getClient } = require('./clients');
+const { getClient, appxInfo } = require('./clients');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -119,6 +119,47 @@ function spawnDetached(exePath, extraEnv, extraArgs) {
 	child.unref();
 }
 
+/** 进程是否已出现（拿不到 spawn 的异步失败，用「进程出现在 tasklist 里」判定启动成功） */
+async function waitProcUp(exeNames, waitMs) {
+	const names = exeNames || [];
+	if (!names.length) return false;
+	const deadline = Date.now() + waitMs;
+	for (;;) {
+		if (names.some(tasklistHas)) return true;
+		if (Date.now() >= deadline) return names.some(tasklistHas);
+		await sleep(400);
+	}
+}
+
+/**
+ * 启动 MSIX 应用（Codex 桌面版）。
+ *
+ * 与普通客户端不同：它装在 C:\Program Files\WindowsApps\<包全名>\app\ 下，包内路径
+ * 不保证能直接执行（ACL 与「应用身份」都归 Windows 管），标准启动方式是让 shell 激活
+ * AppUserModelId：explorer.exe shell:AppsFolder\<PackageFamilyName>!App，
+ * 等价于用户点开始菜单图标。因此：
+ *   1) 先用 shell 激活（常规路径）；
+ *   2) 拉不起来（极少数环境 shell 激活失败）再退回直接执行包内 exe。
+ * 用「进程出现在 tasklist 里」判定，避免把静默失败当成功。
+ */
+async function launchAppx(client, opts, appx, exe) {
+	const names = client.exeNames || [];
+	if (appx && appx.aumid) {
+		const explorer = path.join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe');
+		try {
+			spawnDetached(explorer, null, ['shell:AppsFolder\\' + appx.aumid]);
+		} catch {}
+		if (await waitProcUp(names, 8000)) return true;
+	}
+	if (exe) {
+		try {
+			spawnDetached(exe, opts && opts.env, opts && opts.args);
+		} catch {}
+		if (await waitProcUp(names, 8000)) return true;
+	}
+	return false;
+}
+
 /**
  * 启动（或重启）客户端。
  * @param {object} [opts] - launchOpts：
@@ -131,8 +172,11 @@ async function launchClient(clientId, detected, opts) {
 	const client = getClient(clientId);
 	if (!client) return { status: 'failed', message: '未知客户端' };
 
-	const exe = findLaunchExe(client, detected);
-	if (!exe) {
+	/* MSIX 应用（Codex 桌面版）：常规探测拿不到安装路径，补一次应用包查询；
+	 * 有了 aumid 就能从任意位置启动它，不依赖 exe 路径。 */
+	const appx = client.appx ? appxInfo(client.appx) : null;
+	const exe = findLaunchExe(client, detected) || (appx && appx.exe) || null;
+	if (!exe && !(appx && appx.aumid)) {
 		return { status: 'failed', message: '未找到程序位置，请点击「详情」手动选择路径' };
 	}
 
@@ -155,7 +199,14 @@ async function launchClient(clientId, detected, opts) {
 	}
 
 	try {
-		spawnDetached(exe, opts && opts.env, opts && opts.args);
+		if (client.appx) {
+			const up = await launchAppx(client, opts, appx, exe);
+			if (!up) {
+				return { status: 'failed', message: `启动失败：未能拉起 ${client.name}，请手动打开` };
+			}
+		} else {
+			spawnDetached(exe, opts && opts.env, opts && opts.args);
+		}
 	} catch (e) {
 		return { status: 'failed', message: '启动失败：' + (e.message || e) };
 	}

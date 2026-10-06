@@ -1796,6 +1796,180 @@ async function rollbackZCode(log, client, detected) {
 	return { ok: true };
 }
 
+/* ---------- Codex 桌面版（MSIX 包 OpenAI.Codex，开始菜单显示为 ChatGPT） ----------
+ * 逐条取证（2026-10-07，本机应用包 v26.930.4958.0 / core 0.153.2）：
+ *   1) 应用根 = ~/.codex：包内主进程 resolveCodexHome() = process.env.CODEX_HOME ??
+ *      path.join(os.homedir(), '.codex')；该目录下 .codex-global-state.json 全是
+ *      electron-* 键、goals/queue/thread_history 等 sqlite 也只有桌面端会建，
+ *      且主进程读 <codexHome>/config.toml（asar 内 vCe = 'config.toml'）。
+ *   2) 桌面端建会话时：只有接了 VS Code Copilot 通道才会传 model_provider，
+ *      否则 modelProvider = null（走 config.toml 的默认供应商）——即 config.toml 生效。
+ *   3) 供应商表可用字段（从包内 core 二进制里抠出的 ModelProviderInfo 定义）：
+ *      base_url / model_catalog_url / env_key / env_key_instructions /
+ *      experimental_bearer_token / gateway_oauth / wire_api / query_params /
+ *      request_max_retries / stream_max_retries / stream_idle_timeout_ms /
+ *      websocket_connect_timeout_ms / requires_openai_auth / supports_websockets /
+ *      supports_standalone_web_search —— **没有 http_headers**，因此密钥只能二选一：
+ *        a) env_key + 用户级环境变量（OPENAI_API_KEY 是通用变量名，全局设置会波及其它
+ *           OpenAI 兼容工具，还要额外备份/还原注册表值）；
+ *        b) experimental_bearer_token 内联在 config.toml（桌面端自己的 Copilot 通道
+ *           就是用这个字段传密钥，本版本 core 必然支持）。
+ *      这里取 b：密钥跟着配置文件走，回滚 = 还原 .bak，没有全局副作用。
+ *   4) 绝不写 ~/.codex/auth.json：那是 ChatGPT 账号登录凭据，覆盖会破坏用户登录态。
+ * 默认模型：config.toml 只有一个 model 字段（没有多模型列表的概念），写 cfg.defaultModel。
+ */
+const CODEX_PROVIDER_ID = 'ccb';
+const CODEX_PROVIDER_NAME = 'CCB';
+const CODEX_PROVIDER_HEADER = /^\s*\[\s*model_providers\s*\.\s*"?ccb"?\s*\]\s*$/i;
+/* 写入参数持久化（回滚时用来精准摘掉我们写的 model 行） */
+const CODEX_APPLY_FILE = () => path.join(HOME, '.ccb', 'codex-apply.json');
+
+function codexRoot(client) {
+	return path.join(HOME, (client && client.homeDir) || '.codex');
+}
+
+function codexApplyPath(client) {
+	return (client && typeof client.codexApplyFile === 'string' && client.codexApplyFile) || CODEX_APPLY_FILE();
+}
+
+function codexBlock(cfg) {
+	const model = cfg.defaultModel || (cfg.models && cfg.models[0]) || '';
+	const base = String(cfg.apiBase || '').replace(/\/+$/, '');
+	return [
+		`model_provider = "${CODEX_PROVIDER_ID}"`,
+		`model = "${model}"`,
+		'',
+		`[model_providers.${CODEX_PROVIDER_ID}]`,
+		`name = "${CODEX_PROVIDER_NAME}"`,
+		`base_url = "${base}"`,
+		'wire_api = "chat"',
+		`experimental_bearer_token = "${cfg.apiKey}"`,
+	].join('\n');
+}
+
+/** 摘掉 [model_providers.ccb] 段（到下一个表头或文件尾） */
+function dropCodexProviderTable(lines) {
+	const out = [];
+	let dropping = false;
+	for (const line of lines) {
+		if (CODEX_PROVIDER_HEADER.test(line)) {
+			dropping = true;
+			continue;
+		}
+		if (dropping) {
+			if (/^\s*\[/.test(line)) dropping = false; /* 下面是别的表，落回正常 */
+			else continue;
+		}
+		out.push(line);
+	}
+	return out;
+}
+
+/** 摘掉顶层（第一个表头之前）满足 hit 的赋值行——TOML 的顶层键必须写在任何表头之前 */
+function dropTopLevelLines(lines, hit) {
+	const out = [];
+	let inTable = false;
+	for (const line of lines) {
+		if (/^\s*\[/.test(line)) inTable = true;
+		if (!inTable && hit(line)) continue;
+		out.push(line);
+	}
+	return out;
+}
+
+/**
+ * 行级合并 config.toml：保留用户其它键与其它 provider，只替换我们这套。
+ * 纯函数（不碰文件系统），便于测试。
+ */
+function mergeCodexToml(text, cfg) {
+	const raw = String(text == null ? '' : text);
+	const eol = /\r\n/.test(raw) ? '\r\n' : '\n';
+	let lines = raw.replace(/\r\n/g, '\n').split('\n');
+	lines = dropCodexProviderTable(lines);
+	lines = dropTopLevelLines(lines, (l) => /^\s*(model_provider|model)\s*=/.test(l));
+	while (lines.length && !lines[0].trim()) lines.shift();
+	const body = lines.join('\n').replace(/\n+$/, '');
+	const out = codexBlock(cfg) + '\n' + (body ? '\n' + body + '\n' : '');
+	return out.replace(/\n/g, eol);
+}
+
+/** 摘掉我们写入的内容（无备份时的兜底回滚）。model 从持久化的写入参数里取。纯函数。 */
+function stripCodexToml(text, model) {
+	const raw = String(text == null ? '' : text);
+	const eol = /\r\n/.test(raw) ? '\r\n' : '\n';
+	const esc = String(model || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	const pats = [/^\s*model_provider\s*=\s*"ccb"\s*$/i];
+	if (model) pats.push(new RegExp(`^\\s*model\\s*=\\s*"${esc}"\\s*$`));
+	let lines = dropCodexProviderTable(raw.replace(/\r\n/g, '\n').split('\n'));
+	lines = dropTopLevelLines(lines, (l) => pats.some((re) => re.test(l)));
+	while (lines.length && !lines[0].trim()) lines.shift();
+	while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+	if (!lines.length) return '';
+	return lines.join('\n') + eol;
+}
+
+async function writeCodex(cfg, log, client) {
+	const root = codexRoot(client);
+	const label = (client && client.name) || 'Codex';
+	if (!fs.existsSync(root)) {
+		return { ok: false, error: `未找到 ${root}，请先安装并启动一次 ${label} 再重试` };
+	}
+	const file = path.join(root, 'config.toml');
+	backupOnce(file, log);
+	const before = fs.existsSync(file) ? readText(file) : '';
+	writeText(file, mergeCodexToml(before, cfg));
+	const model = cfg.defaultModel || (cfg.models && cfg.models[0]) || '';
+	log(`已写入 ${file}（供应商 ${CODEX_PROVIDER_ID} → ${String(cfg.apiBase || '').replace(/\/+$/, '')}，默认模型 ${model}）`);
+
+	/* 记下写入参数：回滚且没有 .bak 时按它精准摘掉 model 行 */
+	try {
+		const applyFile = codexApplyPath(client);
+		fs.mkdirSync(path.dirname(applyFile), { recursive: true });
+		fs.writeFileSync(applyFile, JSON.stringify({ model, savedAt: Date.now() }));
+	} catch (e) {
+		log(`提示：参数记录写入失败（不影响本次配置）：${e.message}`);
+	}
+
+	log(`完成。启动 ${label} 后请求即走 CCB 中转，无需再手动改任何设置。`);
+	return { ok: true };
+}
+
+async function rollbackCodex(log, client) {
+	const root = codexRoot(client);
+	const file = path.join(root, 'config.toml');
+	const applyFile = codexApplyPath(client);
+	let saved = null;
+	try {
+		saved = JSON.parse(readText(applyFile));
+	} catch {
+		/* 没有写入参数（或已删除）：无备份时无法确定要摘哪一行 model，按无 model 处理 */
+	}
+
+	let changed = 0;
+	if (fs.existsSync(file)) {
+		if (restoreBackup(file, log)) {
+			changed++;
+		} else {
+			const before = readText(file);
+			const after = stripCodexToml(before, saved && saved.model);
+			if (after !== before) {
+				if (!after.trim()) {
+					fs.rmSync(file);
+					log(`已删除 ${file}（CCB 新建的配置文件）`);
+				} else {
+					writeText(file, after);
+					log(`已从 ${file} 移除 CCB 供应商与默认模型`);
+				}
+				changed++;
+			}
+		}
+	}
+	try { fs.rmSync(applyFile); } catch {}
+
+	log(changed ? '回滚完成。请重启 Codex。' : '没有找到需要回滚的内容。');
+	return { ok: true };
+}
+
 /* ---------- 回滚 ---------- */
 /** 回滚单个配置目录的 models.json / settings.json（WorkBuddy 与 CodeBuddy 共用） */
 function modelsJsonIsCcbOnly(file) {
@@ -1956,6 +2130,7 @@ const WRITERS = {
 	qoderappcn: { apply: writeQoderAppCn, rollback: rollbackQoderAppCn, needsClosed: true },
 	qoderwork: { apply: writeQoderWork, rollback: rollbackQoderWork, needsClosed: true },
 	zcode: { apply: writeZCode, rollback: rollbackZCode, needsClosed: true },
+	codex: { apply: writeCodex, rollback: rollbackCodex, needsClosed: true },
 };
 
 /** 返回需要先关闭的进程名列表（空数组表示无需关闭） */
@@ -2061,4 +2236,6 @@ module.exports = {
 	CURSOR_PROXY_DEFAULT_PORT,
 	saveGuiChoice,
 	accountUidsUnder,
+	mergeCodexToml,
+	stripCodexToml,
 };

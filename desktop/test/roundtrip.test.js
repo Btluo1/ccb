@@ -59,6 +59,8 @@ const REAL_FILES = [
 	path.join(os.homedir(), '.workbuddy-ai', 'models.json'),
 	path.join(os.homedir(), '.workbuddy-ai', 'settings.json'),
 	path.join(os.homedir(), '.workbuddy-ai', 'ccb-workbuddy-gui.json'),
+	path.join(os.homedir(), '.codex', 'config.toml'),
+	path.join(os.homedir(), '.ccb', 'codex-apply.json'),
 ];
 
 function realSnapshot() {
@@ -629,6 +631,159 @@ describe('新增写入器端到端写入/回滚（临时目录）', () => {
 			const r2 = new DatabaseSync(ws2, { readOnly: true });
 			expect(r2.prepare('SELECT COUNT(*) c FROM ItemTable WHERE key = ?').get('Tencent-Cloud.coding-copilot').c).toBe(0);
 			r2.close();
+		} finally {
+			restore();
+		}
+	});
+});
+
+/* Codex 桌面版：写入 ~/.codex/config.toml（行级合并 + 内联 bearer 密钥）。
+ * 全程在临时目录里做，并用 realSnapshot 护栏确认没碰到真实的 ~/.codex。 */
+describe('Codex 桌面版写入（config.toml）', () => {
+	const CFG3 = {
+		apiKey: 'sk-ccb-codex-key',
+		apiBase: 'https://code.btluo.com/v1',
+		models: ['glm-5.3', 'kimi-k2'],
+		defaultModel: 'glm-5.3',
+	};
+	const ROOT = path.join(TMP, 'codex');
+	const FILE = path.join(ROOT, 'config.toml');
+	const APPLY = path.join(TMP, 'codex-apply.json');
+	const SEED = [
+		'model_provider = "codeb"',
+		'model = "claude-sonnet-4-20250514"',
+		'',
+		'[model_providers.codeb]',
+		'name = "Codeb Relay"',
+		'base_url = "https://code.btluo.com/v1"',
+		'wire_api = "chat"',
+		'env_key = "OPENAI_API_KEY"',
+		'',
+		'[tui]',
+		'notifications = true',
+		'',
+	].join('\n');
+
+	let guard;
+	const restoreClient = () =>
+		patchClient('codex', { homeDir: '.ccb-test-tmp/codex', codexApplyFile: APPLY });
+
+	beforeEach(() => {
+		cleanTmp();
+		guard = realSnapshot();
+	});
+	afterEach(() => {
+		expect(realSnapshot()).toBe(guard);
+		cleanTmp();
+	});
+
+	const writeSeed = () => {
+		fs.mkdirSync(ROOT, { recursive: true });
+		fs.writeFileSync(FILE, SEED);
+	};
+
+	it('写入：顶层指向 ccb、密钥内联，用户自己的 provider 与其它表原样保留', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			const r = await applyConfig('codex', CFG3);
+			expect(r.ok).toBe(true);
+
+			const text = fs.readFileSync(FILE, 'utf8');
+			expect(text).toContain('model_provider = "ccb"');
+			expect(text).toContain('model = "glm-5.3"');
+			expect(text).toContain('[model_providers.ccb]');
+			expect(text).toContain('base_url = "https://code.btluo.com/v1"');
+			expect(text).toContain('wire_api = "chat"');
+			expect(text).toContain('experimental_bearer_token = "sk-ccb-codex-key"');
+			/* 顶层键只出现一次：旧的 model_provider/model 是替换掉的，不是追加 */
+			expect(text.match(/^model_provider\s*=/gm).length).toBe(1);
+			expect(text.match(/^model\s*=/gm).length).toBe(1);
+			/* 用户原有内容一字不动 */
+			expect(text).toContain('[model_providers.codeb]');
+			expect(text).toContain('name = "Codeb Relay"');
+			expect(text).toContain('env_key = "OPENAI_API_KEY"');
+			expect(text).toContain('[tui]');
+			expect(text).toContain('notifications = true');
+
+			expect(JSON.parse(fs.readFileSync(APPLY, 'utf8')).model).toBe('glm-5.3');
+		} finally {
+			restore();
+		}
+	});
+
+	it('幂等：二次写入不重复 provider 段，.bak 恒为首次写入前的原始文件', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			await applyConfig('codex', CFG3);
+			const first = fs.readFileSync(FILE, 'utf8');
+			await applyConfig('codex', CFG3);
+			const second = fs.readFileSync(FILE, 'utf8');
+
+			expect(second).toBe(first);
+			expect(second.match(/\[model_providers\.ccb\]/g).length).toBe(1);
+			expect(fs.readFileSync(FILE + '.bak', 'utf8')).toBe(SEED);
+		} finally {
+			restore();
+		}
+	});
+
+	it('回滚：优先还原备份，与原文件逐字节一致', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			await applyConfig('codex', CFG3);
+			const r = await rollbackConfig('codex');
+			expect(r.ok).toBe(true);
+			expect(fs.readFileSync(FILE, 'utf8')).toBe(SEED);
+			expect(fs.existsSync(APPLY)).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it('无备份时的兜底回滚：精准摘掉 CCB 供应商与默认模型，用户内容保留', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			await applyConfig('codex', CFG3);
+			fs.rmSync(FILE + '.bak');
+			await rollbackConfig('codex');
+
+			const text = fs.readFileSync(FILE, 'utf8');
+			expect(text).not.toContain('[model_providers.ccb]');
+			expect(text).not.toContain('model_provider = "ccb"');
+			expect(text).not.toContain('sk-ccb-codex-key');
+			expect(text).not.toContain('glm-5.3');
+			expect(text).toContain('[model_providers.codeb]');
+			expect(text).toContain('[tui]');
+		} finally {
+			restore();
+		}
+	});
+
+	it('原本没有 config.toml 时：写入新建、回滚删除（不留空文件）', async () => {
+		const restore = restoreClient();
+		try {
+			fs.mkdirSync(ROOT, { recursive: true });
+			expect((await applyConfig('codex', CFG3)).ok).toBe(true);
+			expect(fs.existsSync(FILE)).toBe(true);
+			await rollbackConfig('codex');
+			expect(fs.existsSync(FILE)).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	it('未安装（应用根不存在）时报错而不是凭空造配置', async () => {
+		const restore = restoreClient();
+		try {
+			const r = await applyConfig('codex', CFG3);
+			expect(r.ok).toBe(false);
+			expect(r.error).toContain('请先安装并启动');
+			expect(r.error).toContain(ROOT);
+			expect(fs.existsSync(FILE)).toBe(false);
 		} finally {
 			restore();
 		}

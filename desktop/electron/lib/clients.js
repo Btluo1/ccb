@@ -22,9 +22,10 @@ const APP_PATH_ROOTS = [
 ];
 
 /**
- * 支持的客户端清单（14 项，全部为**桌面客户端**）
+ * 支持的客户端清单（15 项，全部为**桌面客户端**）
  *
- * 产品定位：一键配置面向桌面客户端，不含 CLI 工具（Codex CLI 已下架，
+ * 产品定位：一键配置面向桌面客户端，不含 CLI 工具（Codex CLI 不配置——它属于终端工具，
+ * 但同名产品的 Codex 桌面版（MSIX 包 OpenAI.Codex，开始菜单显示为 ChatGPT）在清单内；
  * 也不写 traecli 的 YAML——那些是各自 CLI 的独占配置）。
  * 清单里的每一项都必须能做到一键写入，做不到的不进清单（见下方「已下架」）。
  *
@@ -34,6 +35,9 @@ const APP_PATH_ROOTS = [
  *   homeDir    —— 用户主目录下的产品数据目录（~/.trae、~/.qoder 等），部分产品把配置放这里
  *   cli        —— 命令行程序名（where 探测）
  *   configDirs —— 需要逐目录检查 models.json 的配置目录（WorkBuddy / CodeBuddy 系）
+ *   appx       —— MSIX 应用包（{ name, subdir, exe }）：安装路径不在 App Paths /
+ *                 卸载表 / 开始菜单 .lnk 里，只能靠 Get-AppxPackage 查，启动走
+ *                 shell:AppsFolder（见 launcher.js）
  *   writer     —— writers.js 中的写入器名
  *   trayApp    —— 常驻托盘的应用（关窗口不退进程）。关闭时必须直接 /F /T 结束整棵树，
  *                 不能走「先 taskkill 不带 /F」的优雅关闭（见 launcher.js 的说明）
@@ -50,6 +54,9 @@ const APP_PATH_ROOTS = [
  *     settings.json / .models 缓存；桌面版的模型列表来自内置 qodercli 的模型目录
  *
  * 已下架（无法一键写入，不列入支持清单）：
+ *   - Codex CLI（@openai/codex 终端工具）：属于 CLI，不在「桌面客户端」定位内
+ *     （它读的是同一份 ~/.codex/config.toml，一键配置写入后终端侧同样可用，
+ *     但清单里只登记桌面版，见上方 codex 条目）。
  *   - Kiro：逐 bundle 取证确认没有任何 BYOK 通道——扩展未注册语言模型提供方，
  *     不读 ANTHROPIC_BASE_URL 等环境变量，请求走私有协议 runtime.{region}.kiro.dev，
  *     普通 OpenAI/Anthropic 兼容中转无法对接。
@@ -90,6 +97,7 @@ const BRAND_ICONS = {
 	'wb-cn': 'workbuddy',
 	zcode: 'zcode',
 	cursor: 'cursor',
+	codex: 'codex',
 };
 
 /**
@@ -231,6 +239,21 @@ const CLIENTS = [
 		glyph: 'C', accent: '#475569', mode: 'auto', writer: 'cursor', provider: 'cursor',
 		appDirs: ['Cursor', 'cursor'],
 		exeNames: ['Cursor.exe'],
+	},
+	{
+		/* Codex 桌面版 = MSIX 应用包 OpenAI.Codex（开始菜单里显示为 ChatGPT，
+		 * 本机 DisplayName 也是 "ChatGPT"，故按包名识别而不是显示名）。
+		 * 应用根 ~/.codex（包内主进程 resolveCodexHome() = CODEX_HOME ?? ~/.codex，
+		 * 该目录下的 .codex-global-state.json 全是 electron-* 键、各 sqlite 也只有
+		 * 桌面端会建），配置 = ~/.codex/config.toml 的 model_provider 指向
+		 * [model_providers.ccb]（详见 writers.js writeCodex）。
+		 * exeNames 用包内主进程名 ChatGPT.exe：仅用于进程守卫与"应用是否已启动"判定，
+		 * 启动本身走 shell:AppsFolder 激活（WindowsApps 下的路径不保证可执行）。 */
+		id: 'codex', name: 'Codex', variant: '桌面版', vendor: 'OpenAI', site: 'openai.com',
+		glyph: 'CX', accent: '#0f172a', mode: 'auto', writer: 'codex', provider: 'openai',
+		exeNames: ['ChatGPT.exe'],
+		homeDir: '.codex',
+		appx: { name: 'OpenAI.Codex', subdir: 'app', exe: 'ChatGPT.exe' },
 	},
 ];
 
@@ -416,6 +439,49 @@ function findExeEverywhere(exeNames) {
 	return null;
 }
 
+/**
+ * 查询 MSIX 应用包（Get-AppxPackage）。
+ *
+ * 这类应用（Codex 桌面版 = OpenAI.Codex）装在 C:\Program Files\WindowsApps\<包全名>\ 下，
+ * 既不在注册表 App Paths、也不在卸载表与开始菜单 .lnk 里，常规探测一个都找不到。
+ * 返回 { familyName, aumid, installLocation, exe }；未安装（或 PowerShell 查询失败）返回 null。
+ *   aumid —— AppUserModelId（<PackageFamilyName>!App），启动用 shell:AppsFolder\<aumid>
+ *   exe   —— 包内主程序完整路径（可能因 ACL 不可直接执行，仅作展示/兜底启动）
+ */
+const appxCache = new Map();
+function appxInfo(spec) {
+	if (!spec || !spec.name) return null;
+	if (appxCache.has(spec.name)) return appxCache.get(spec.name);
+	let info = null;
+	try {
+		const r = spawnSync(
+			'powershell',
+			[
+				'-NoProfile', '-NonInteractive', '-Command',
+				`Get-AppxPackage -Name '${spec.name}' | Select-Object -First 1 PackageFamilyName,InstallLocation | ConvertTo-Json -Compress`,
+			],
+			{ encoding: 'utf8', timeout: 15000, windowsHide: true }
+		);
+		if (r.status === 0 && r.stdout && r.stdout.trim()) {
+			const j = JSON.parse(r.stdout.trim());
+			if (j && j.PackageFamilyName) {
+				const dir = j.InstallLocation || '';
+				const exe = spec.exe && dir ? path.join(dir, spec.subdir || '', spec.exe) : null;
+				info = {
+					familyName: j.PackageFamilyName,
+					aumid: j.PackageFamilyName + '!App',
+					installLocation: dir || null,
+					exe: exe && exists(exe) ? exe : null,
+				};
+			}
+		}
+	} catch {
+		/* 查询失败按未安装处理：用户仍可在「详情」里手动指定路径 */
+	}
+	appxCache.set(spec.name, info);
+	return info;
+}
+
 /** 按产品显示名（忽略大小写与空格差异）查安装目录 */
 function regQueryInstallLocation(names) {
 	const wanted = names.map((n) => n.toLowerCase().replace(/\s+/g, ''));
@@ -589,6 +655,20 @@ function detectOne(c, customPaths) {
 		}
 	}
 
+	/* MSIX 应用包（Codex 桌面版）：常规探测覆盖不到，靠 Get-AppxPackage 查 */
+	if (c.appx) {
+		const info = appxInfo(c.appx);
+		if (info) {
+			result.installed = true;
+			result.details.appx = info;
+			result.evidence.push(`应用包：${info.familyName}`);
+			if (info.exe && !result.details.exePath) {
+				result.details.exePath = info.exe;
+				result.evidence.push(`程序：${info.exe}`);
+			}
+		}
+	}
+
 	/* 兜底：按可执行文件名去开始菜单快捷方式与卸载表里找真实安装位置。
 	 * 这一步专门解决「装在自定义目录（F:\rhhj\WorkBuddy 之类）」导致配置写得进、客户端却起不来的问题。 */
 	if (c.exeNames && !result.details.exePath && !(result.details.apps || []).some((a) => a.exe)) {
@@ -625,7 +705,14 @@ function detectOne(c, customPaths) {
 	return result;
 }
 
-function detectClients(customPaths) {
+/**
+ * 检测全部客户端。
+ * @param {object} [customPaths] 用户手动指定的路径
+ * @param {{fresh?: boolean}} [opts] fresh —— 清掉 MSIX 应用包查询缓存后再扫
+ *   （「重新检测」按钮用：刚装好的应用这次才能被发现，否则会命中上一次的未安装结果）
+ */
+function detectClients(customPaths, opts) {
+	if (opts && opts.fresh) appxCache.clear();
 	return CLIENTS.map((c) => detectOne(c, customPaths));
 }
 
@@ -637,4 +724,5 @@ module.exports = {
 	CLIENTS, detectClients, getClient, APPDATA, HOME,
 	whereCmd, regQueryUserEnv, regQueryExe, regQueryInstallLocation, findExeEverywhere,
 	uninstallEntries, startMenuTargets, findExeDeep, validateCustomPath, resolveCustomExe,
+	appxInfo,
 };

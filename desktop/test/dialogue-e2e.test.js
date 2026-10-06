@@ -114,6 +114,8 @@ const REAL_FILES = [
 	path.join(os.homedir(), '.codebuddy', 'settings.json'),
 	path.join(os.homedir(), '.workbuddy', 'models.json'),
 	path.join(os.homedir(), '.workbuddy-ai', 'models.json'),
+	path.join(os.homedir(), '.codex', 'config.toml'),
+	path.join(os.homedir(), '.ccb', 'codex-apply.json'),
 ];
 
 function realSnapshot() {
@@ -194,6 +196,22 @@ const READERS = {
 			model: 'glm-5.3',
 		};
 	},
+	/* Codex 桌面版：~/.codex/config.toml（顶层 model_provider/model + [model_providers.ccb]）。
+	 * 按 codex core 的读法取值：base_url + /chat/completions（wire_api=chat）、
+	 * experimental_bearer_token 作 Authorization。 */
+	codex: () => {
+		const text = fs.readFileSync(path.join(TMP, 'codex', 'config.toml'), 'utf8');
+		const pick = (key) => {
+			const m = new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, 'm').exec(text);
+			return m && m[1];
+		};
+		expect(text).toMatch(/^\s*model_provider\s*=\s*"ccb"\s*$/m);
+		return {
+			endpoint: pick('base_url') + '/chat/completions',
+			apiKey: pick('experimental_bearer_token'),
+			model: pick('model'),
+		};
+	},
 };
 
 /* 各客户端写入前的环境铺垫（模拟「已安装并启动过一次」的现场） */
@@ -247,6 +265,14 @@ function seedClient(id) {
 		);
 		seed.close();
 	}
+	if (id === 'codex') {
+		/* writeCodex 要求应用根已存在；顺带放一份用户既有配置，验证行级合并不动它 */
+		fs.mkdirSync(path.join(TMP, 'codex'), { recursive: true });
+		fs.writeFileSync(
+			path.join(TMP, 'codex', 'config.toml'),
+			'[model_providers.other]\nname = "Other"\nbase_url = "https://example.com/v1"\n'
+		);
+	}
 }
 
 /* patchClient 的目录改写（各客户端 → 临时目录） */
@@ -258,6 +284,7 @@ const PATCHES = {
 	'qoder-app-cn': { homeDir: '.ccb-test-tmp-e2e/qappcn' },
 	'qoderwork-cn': { homeDir: '.ccb-test-tmp-e2e/qw', appDirs: ['.ccb-test-tmp-e2e/qwapp'], exeNames: [] },
 	cursor: { appDirs: ['.ccb-test-tmp-e2e/cursorapp'] },
+	codex: { homeDir: '.ccb-test-tmp-e2e/codex', codexApplyFile: path.join(TMP, 'codex-apply.json') },
 };
 
 /* ---------- 逐客户端的对话闭环 ---------- */
@@ -345,6 +372,7 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 			qoderappcn: 'qoder-app-cn',
 			qoderwork: 'qoderwork-cn',
 			cursor: 'cursor',
+			codex: 'codex',
 		};
 		const writersInUse = new Set(CLIENTS.map((c) => c.writer));
 		/* 清单里出现的每个写入器都必须有代表用例（防止新增写入器时漏掉对话验收） */

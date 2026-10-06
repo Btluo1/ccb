@@ -356,7 +356,8 @@ function stopQoderProxy() {
 }
 
 /* ---------- 客户端 ---------- */
-ipcMain.handle('clients:detect', () => detectClients(store.load().customPaths || {}));
+/* fresh：清掉 MSIX 应用包（Codex 桌面版）的查询缓存再扫，「重新检测」才能发现刚装好的应用 */
+ipcMain.handle('clients:detect', () => detectClients(store.load().customPaths || {}, { fresh: true }));
 
 /* Qoder CN IDE 一键配置 v2（Plan B）：启动前准备 + 带代理环境变量启动 */
 function qoderCnLaunchOpts() {

@@ -4,7 +4,7 @@
 
 # CCB · AI 编程助手一键配置
 
-把 Trae / Qoder / CodeBuddy / WorkBuddy / Cursor / ZCode 等 AI 编程客户端一键接入 CCB —— 自动写入全部可用模型、自动设为默认模型、自动启动，打开即用。
+把 Trae / Qoder / CodeBuddy / WorkBuddy / Cursor / ZCode / Codex 等 AI 编程客户端一键接入 CCB —— 自动写入全部可用模型、自动设为默认模型、自动启动，打开即用。
 
 [![最新版本](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fccb.btluo.com%2Fapi%2Flatest&query=%24.version&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=2f6fed)](https://ccb.btluo.com)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows11&logoColor=white)
@@ -19,7 +19,7 @@
 CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工具：登录 CCB 账号后，选中你已经安装的客户端，点一次按钮即可完成全部接入配置。
 
 - **一键配置并启动**：自动获取平台密钥 → 批量写入全部可用模型 → 设为当前模型 → 启动客户端（运行中的自动重启）。
-- **覆盖主流客户端**：Trae / TraeCode / TraeWork、Qoder CN / QoderWork、CodeBuddy、WorkBuddy、ZCode、Cursor，共 13 个客户端或版本。
+- **覆盖主流客户端**：Trae / TraeCode / TraeWork、Qoder CN / QoderWork、CodeBuddy、WorkBuddy、ZCode、Cursor、Codex，共 14 个客户端或版本。
 - **全部模型按官方定价 2 折计费**，按输入 / 输出 token 用量从余额扣费；兑换卡充值即时到账。
 - **随时可回滚**：写入前自动备份原配置（`*.bak`），在「详情」里一键恢复原样。
 - **内置帮助文档**：客户端底部「遇到问题？」帮助区，常见问题支持关键词搜索、断网可用。
@@ -44,6 +44,7 @@ CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工�
 | WorkBuddy / WorkBuddy AI | 中国版 / 国际版 | 写入模型配置 + 工作区状态库 | 未登录时默认模型需在模型选择器里手选一次 |
 | ZCode | — | 写入供应商配置与当前模型 | 打开即用 |
 | Cursor | — | 官方自定义模型（BYOK）/ 本地代理（MITM，实验） | MITM 模式需安装根证书，并在使用期间保持 CCB 运行 |
+| Codex | 桌面版（MSIX，开始菜单显示为 ChatGPT） | 写入 `~/.codex/config.toml` 的自定义供应商 | 打开即用；不写 ChatGPT 登录凭据（`auth.json`） |
 
 > Qoder IDE 国际版（qoder.com）因客户端聊天走自有加密协议，暂不支持接入。
 
@@ -92,6 +93,12 @@ CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工�
 </details>
 
 <details>
+<summary>Codex 桌面版（开始菜单里叫「ChatGPT」）会改写我的 ChatGPT 账号吗？</summary>
+
+不会。CCB 只写 `~/.codex/config.toml`：把默认供应商指向 `[model_providers.ccb]`，密钥内联在该条目里。`~/.codex/auth.json`（ChatGPT 登录凭据）完全不动，应用要求登录时用你自己的账号登录即可。回滚会把 `config.toml` 还原成配置前的样子。
+</details>
+
+<details>
 <summary>想撤销配置 / 恢复原样？</summary>
 
 打开对应客户端的「详情」，点「回滚」——CCB 写入前会自动备份原文件（`*.bak`），回滚完整恢复写入前的配置。
@@ -132,7 +139,7 @@ desktop/
 ## 开源范围与免责声明
 
 - 本仓库仅包含桌面配置端（`desktop/`）；账号服务、计费、API 网关等云端代码不在开源范围内。
-- 本项目是本地配置辅助工具：通过写入客户端的本地配置文件、或在本机运行代理的方式实现接入；与 Trae、Qoder、CodeBuddy、WorkBuddy、Cursor、ZCode 等厂商没有隶属或合作关系，相关商标归各自权利人所有。
+- 本项目是本地配置辅助工具：通过写入客户端的本地配置文件、或在本机运行代理的方式实现接入；与 Trae、Qoder、CodeBuddy、WorkBuddy、Cursor、ZCode、OpenAI 等厂商没有隶属或合作关系，相关商标归各自权利人所有。
 - 请在各客户端服务条款允许的范围内使用本工具；因使用行为产生的一切后果由使用者自行承担。
 
 ## 许可证

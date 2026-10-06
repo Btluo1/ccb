@@ -20,6 +20,7 @@ async function copyText(text) {
 
 const state = {
 	user: null,
+	usage: null,     // { today, total }：/api/user/profile 返回的用量（美元，北京时间口径）
 	models: [],
 	client: null,
 	clients: [],
@@ -52,6 +53,11 @@ const state = {
 const selectedModels = () => state.models;
 const modelIds = () => state.models.map((m) => m.id);
 const fmtCredits = (n) => '$' + Number(n || 0).toFixed(2);
+/* 用量金额常小到 $0.000x 级别，固定 2 位小数会显示成 $0.00，这里用 4 位 */
+const fmtUsage = (n) => {
+	const v = Number(n || 0);
+	return v === 0 ? '$0.00' : '$' + v.toFixed(4);
+};
 
 function maskedKey(key) {
 	if (!key) return 'YOUR_API_KEY';
@@ -95,8 +101,10 @@ function enterMain() {
 	if (!state.onboarded && !guideShownThisSession) setTimeout(startGuide, 350);
 }
 
-function setUser(user) {
+function setUser(user, usage) {
 	state.user = user || null;
+	/* 旧服务端 profile 无 usage 字段时保留上次值，登出时统一清空 */
+	if (usage) state.usage = usage;
 	renderUser();
 }
 
@@ -106,6 +114,16 @@ function renderUser() {
 	const v = $('#balanceValue');
 	v.textContent = fmtCredits(state.user.credits);
 	v.classList.toggle('low', !(Number(state.user.credits) > 0));
+	/* 今日 / 累计用量：客户端跑模型按量扣费后，这里能看到花了多少 */
+	const t = $('#usageToday');
+	const tot = $('#usageTotal');
+	if (state.usage) {
+		t.textContent = fmtUsage(state.usage.today);
+		tot.textContent = fmtUsage(state.usage.total);
+	} else {
+		t.textContent = '—';
+		tot.textContent = '—';
+	}
 	renderGuideHints();
 }
 
@@ -173,12 +191,20 @@ async function submitAuth() {
 	setUser(r.user);
 	enterMain();
 	loadModelsSilently();
+	/* 登录接口的返回不含用量数据，进主界面后静默补拉一次今日 / 累计用量 */
+	window.ccb.api
+		.profile()
+		.then((p) => {
+			if (p && p.user) setUser(p.user, p.usage);
+		})
+		.catch(() => {});
 	toast(reg ? '注册成功，已自动登录' : '登录成功');
 }
 
 async function doLogout() {
 	await window.ccb.auth.logout();
 	state.user = null;
+	state.usage = null;
 	state.keys = {};
 	state.results = {};
 	state.running = {};
@@ -190,16 +216,21 @@ async function doLogout() {
 
 /* ================= 模型 ================= */
 async function loadModelsSilently() {
-	if (state.models.length) return;
-	const m = await window.ccb.api.models();
-	if (m && Array.isArray(m.models)) {
-		const list = m.models.filter((x) => x && x.id && x.available !== false);
-		if (list.length) {
-			state.models = list.map((x) => ({ id: x.id, codebuddyModel: x.codebuddyModel || x.id, selected: true }));
-			ensureDefaultModel();
-			persist();
-			renderModels();
+	/* 每次启动都静默刷新：服务端模型目录会持续新增，本地缓存只在请求失败时兜底，
+	   否则老用户会永远停在首次配置时的旧模型列表（v1.0.13 及之前的缺陷） */
+	try {
+		const m = await window.ccb.api.models();
+		if (m && Array.isArray(m.models)) {
+			const list = m.models.filter((x) => x && x.id && x.available !== false);
+			if (list.length) {
+				state.models = list.map((x) => ({ id: x.id, codebuddyModel: x.codebuddyModel || x.id, selected: true }));
+				ensureDefaultModel();
+				persist();
+				renderModels();
+			}
 		}
+	} catch {
+		/* 网络异常：保留本地缓存列表 */
 	}
 }
 
@@ -260,7 +291,7 @@ async function doRedeem() {
 	if (r && !r.error) {
 		input.value = '';
 		const p = await window.ccb.api.profile();
-		if (p && p.user) setUser(p.user);
+		if (p && p.user) setUser(p.user, p.usage);
 		el.className = 'status ok';
 		el.textContent = `✓ 兑换成功，获得 ${fmtCredits(r.credits)}，当前余额 ${fmtCredits(state.user ? state.user.credits : 0)}`;
 		toast('兑换成功');
@@ -394,7 +425,7 @@ async function applyAll() {
 			await doLogout();
 			return;
 		}
-		setUser(p.user);
+		setUser(p.user, p.usage);
 		if (!(Number(p.user.credits) > 0)) toast('提示：当前余额为 0，建议先在上方兑换卡密');
 
 		/* 2. 获取模型列表 */
@@ -859,6 +890,26 @@ function qoderProxySection(c) {
 </div>`;
 }
 
+/* ---- Codex 桌面版说明 ----
+ * 它的安装形态与其它客户端都不同：MSIX 应用包（开始菜单里显示为 ChatGPT），
+ * 配置写在应用根 ~/.codex/config.toml 的 [model_providers.ccb] 里，密钥内联在该条目
+ * （experimental_bearer_token）——不写全局环境变量、不碰 ChatGPT 登录凭据 auth.json。 */
+function codexSection(c) {
+	if (c.id !== 'codex') return '';
+	return `
+<div class="pathblock mitmblock">
+	<div class="pb-head"><span class="pb-title">Codex 桌面版的接入方式</span></div>
+	<div class="mitm-note">
+		写入位置：<code>~/.codex/config.toml</code>（默认供应商指向 CCB，密钥内联在
+		<code>[model_providers.ccb]</code> 条目里）。<br>
+		<b>不会改动你的 ChatGPT 登录凭据</b>（<code>auth.json</code> 不写）：应用要求登录时，
+		用你自己的账号登录即可，与 CCB 配置互不影响。<br>
+		配置在应用启动时读取，写入后 CCB 会自动重启它；回滚会把 <code>config.toml</code>
+		还原成配置前的样子。
+	</div>
+</div>`;
+}
+
 function renderPanel() {
 	const el = $('#panel');
 	const c = state.clients.find((x) => x.id === state.client);
@@ -883,7 +934,7 @@ function renderPanel() {
 					Qoder IDE 系客户端的聊天功能走自有的 <code>cosy</code> 加密协议（非标准 OpenAI 请求），
 					推理在服务端执行，第三方中转无法注入自定义模型。<br><br>
 					<b>CLI 通道可用</b>：终端运行 <code>qoderclicn -m ccb/&lt;模型名&gt; -p "你的问题"</code>
-					即可使用 CCB 中转的 21 个模型（配置已自动写入 <code>~/.qoder-cn/settings.json</code>）。<br><br>
+					即可使用 CCB 中转的 ${state.models.length} 个模型（配置已自动写入 <code>~/.qoder-cn/settings.json</code>）。<br><br>
 					<b>QoderWork（对话式客户端）不受此限制</b>：其聊天链路已打通，可正常使用一键配置。
 				</div>
 			</div>
@@ -901,7 +952,7 @@ function renderPanel() {
 				<div class="panel-sub">${esc(c.vendor)} · 支持<b>全自动写入</b></div>
 			</div>
 		</div>
-		<div class="panel-body">${autoPanel(c)}${cursorMitmSection(c)}${qoderProxySection(c)}${pathSection(c)}</div>
+		<div class="panel-body">${autoPanel(c)}${cursorMitmSection(c)}${qoderProxySection(c)}${codexSection(c)}${pathSection(c)}</div>
 	</div>`;
 	if (c.id === 'cursor' && state.cursorMode === 'mitm') refreshMitmStatus();
 }
@@ -1169,6 +1220,16 @@ const HELP_ITEMS = [
 		q: 'Kimi 的模型选择器里看不到 CCB 模型',
 		a: `<p>这是 Kimi 桌面版的限制：配置已写入并对聊天生效，但模型不会出现在它的选择器里，属正常现象。</p>
 		<p>若 Kimi 官方启动时同步覆盖了当前模型，回到本窗口重新点一次「一键配置并启动」即可。</p>`,
+	},
+	{
+		q: 'Codex 桌面版在开始菜单里叫「ChatGPT」，会改写我的 ChatGPT 账号吗？',
+		a: `<p>不会。CCB 只写应用根目录下的 <code>~/.codex/config.toml</code>：把默认供应商指向
+		<code>[model_providers.ccb]</code>，密钥内联在该条目里。</p>
+		<ol class="qa-steps">
+			<li><b>不碰登录凭据</b>：<code>~/.codex/auth.json</code> 与 ChatGPT 账号登录态完全不动；应用要求登录时，用你自己的账号登录即可。</li>
+			<li><b>配置在应用启动时读取</b>：CCB 写入后会自动重启它；如果你自己启动过，完全退出再打开即可生效。</li>
+			<li><b>要恢复原样</b>：在「详情」里点「回滚」，<code>config.toml</code> 会还原成配置前的样子。</li>
+		</ol>`,
 	},
 	{
 		q: '想撤销配置 / 恢复原样',
@@ -1644,7 +1705,7 @@ async function init() {
 	if (st.loggedIn) {
 		const p = await window.ccb.api.profile();
 		if (p && p.user) {
-			setUser(p.user);
+			setUser(p.user, p.usage);
 			enterMain();
 			loadModelsSilently();
 			return;
