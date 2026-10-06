@@ -19,7 +19,7 @@
 CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工具：登录 CCB 账号后，选中你已经安装的客户端，点一次按钮即可完成全部接入配置。
 
 - **一键配置并启动**：自动获取平台密钥 → 批量写入全部可用模型 → 设为当前模型 → 启动客户端（运行中的自动重启）。
-- **覆盖主流客户端**：Trae / TraeCode / TraeWork、Qoder CN / QoderWork、CodeBuddy、WorkBuddy、ZCode、Cursor、Codex，共 14 个客户端或版本。
+- **覆盖主流客户端**：Trae / TraeCode / TraeWork、Qoder CN 桌面版 / QoderWork、CodeBuddy、WorkBuddy、ZCode、Cursor、Codex，共 13 个客户端或版本。
 - **全部模型按官方定价 2 折计费**，按输入 / 输出 token 用量从余额扣费；兑换卡充值即时到账。
 - **随时可回滚**：写入前自动备份原配置（`*.bak`），在「详情」里一键恢复原样。
 - **内置帮助文档**：客户端底部「遇到问题？」帮助区，常见问题支持关键词搜索、断网可用。
@@ -37,7 +37,6 @@ CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工�
 | Trae | 国际版 | 官方自定义模型（写入 Trae 账号） | 需先在客户端登录 |
 | TraeCode | 中国版 | 官方自定义模型（写入 Trae 账号） | 需先在客户端登录 |
 | TraeWork | 国际版 / 中国版 | 官方自定义模型（与 Trae 共用账号） | 需先在客户端登录 |
-| Qoder CN IDE | 中国版 | 预定义 provider + 本地代理重定向 | 写入后从任意入口启动均可用；回滚会清理本地代理 |
 | Qoder CN | 桌面版 | 本地 worker 桥接 | 打开即用 |
 | QoderWork | 国际版 / 中国版 | 本地 worker 桥接 | 首次需在客户端登录一次 |
 | CodeBuddy | 中国版 | 写入模型配置 + 工作区选中模型 | 打开即用 |
@@ -46,7 +45,7 @@ CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工�
 | Cursor | — | 官方自定义模型（BYOK）/ 本地代理（MITM，实验） | MITM 模式需安装根证书，并在使用期间保持 CCB 运行 |
 | Codex | 桌面版（MSIX，开始菜单显示为 ChatGPT） | 写入 `~/.codex/config.toml` 的自定义供应商 | 打开即用；不写 ChatGPT 登录凭据（`auth.json`） |
 
-> Qoder IDE 国际版（qoder.com）因客户端聊天走自有加密协议，暂不支持接入。
+> Qoder IDE 系（qoder.com 国际版与 qoder.com.cn 中国版）不列入支持清单：它们的聊天推理在 Qoder 云端执行、用 Qoder 登录态鉴权，模型端点由服务端按「服务商」写死（服务商是固定厂商列表，没有可填的自定义地址项），第三方中转无法接入。Qoder CN 桌面版与 QoderWork 走的是本机 worker，不受此限制。
 
 ## 快速开始
 

@@ -323,17 +323,21 @@ function clientIcon(c, cls) {
 	return `<div class="cicon ${cls || ''}" style="--a:${c.accent}"><span class="${wide ? 'wide' : ''}">${esc(c.glyph)}</span></div>`;
 }
 
-/* Qoder IDE 国际版（qoder-intl）暂不可用：IDE 内聊天走 cosy 加密信端 + 服务端 BYOK，
- * 第三方中转无法注入；CLI 通道（qodercli）配置已写入但需用户自行在终端使用。
- * Qoder CN 系已全部打通：
- *   - Qoder CN IDE（qoder-cn，Plan B）：模型挂官方预定义 provider 过 UI 校验，本地
- *     MITM 代理（qoderproxy 9183）重定向 sk-ccb 请求到中转；退出清空对冲 reapplyQoderCn，
- *     CCB 桌面端启动时自动恢复代理（settings.json / vscdb 双条件）。
- *   - Qoder CN 桌面版（qoder-app-cn）：聊天走 qoder-cn-agent-sdk worker runtime，
- *     qoderbridge 双契约桥（EventEmitter + chunks）sk-ccb- 请求直连中转，
- *     2026-10-02 E2E 全链路实机验证通过（UI 聊天 → 中转 → 计费）。
- * QoderWork 系（qoderwork-cn / qoderwork-intl）已于 2026-10-01 打通：同 worker 桥方案。 */
-const UNSUPPORTED = new Set(['qoder-intl']);
+/* Qoder IDE 系（qoder-intl 国际版 / qoder-cn 中国版）暂不可用：两者的聊天推理都在
+ * Qoder 云端执行，模型端点由服务端按「服务商」写死，客户端无法指向第三方中转。逐步取证：
+ *   1) CN IDE 的推理请求发往 gateway.qoder.com.cn/algo/api/v2/service/pro/sse/
+ *      agent_chat_generation，鉴权用 Qoder 登录 token（不是 per-model 的 sk-ccb 密钥），
+ *      请求体 CosyClient 加密（Encode=1）→ 本地 MITM 既识别不出、也改不了。
+ *   2) 自定义模型的「服务商」是服务端下发的固定 7 家（bailian/qwencloud-cn/zhipu/kimi/
+ *      minimax/deepseek/xiaomi-china），fields 只有 api_key，没有 endpoint/base_url 输入项。
+ *   3) 实测两点互证（2026-10-07）：provider='custom'（自造 key）→ 云端 100400
+ *      「Failed to generate custom pool」；provider='zhipu'（官方已知 key）→ 池建起来了，
+ *      但按智谱官方端点鉴权我们的 sk-ccb → 「自定义模型认证失败」。即端点永远在官方，
+ *      条目里的 baseUrl 不被采用（v3 挂 deepseek 时也是同一结论）。
+ * 客户端仍保留写入器（老用户可回滚），但不再出现在一键配置清单里。
+ * 已打通的是：Qoder CN 桌面版（qoder-app-cn，本机运行 worker + qoderbridge 桥）、
+ * QoderWork 系（qoderwork-cn / qoderwork-intl，同 worker 桥方案）。 */
+const UNSUPPORTED = new Set(['qoder-intl', 'qoder-cn']);
 
 function clientStatus(c) {
 	if (UNSUPPORTED.has(c.id)) return { cls: 'st-unsupported', label: '暂不可用' };
@@ -928,17 +932,17 @@ function renderPanel() {
 			</div>
 		</div>
 		<div class="panel-body">
-			<div class="pathblock mitmblock">
-				<div class="pb-head"><span class="pb-title">为什么暂不可用</span></div>
-				<div class="mitm-note">
-					Qoder IDE 系客户端的聊天功能走自有的 <code>cosy</code> 加密协议（非标准 OpenAI 请求），
-					推理在服务端执行，第三方中转无法注入自定义模型。<br><br>
-					<b>CLI 通道可用</b>：终端运行 <code>qoderclicn -m ccb/&lt;模型名&gt; -p "你的问题"</code>
-					即可使用 CCB 中转的 ${state.models.length} 个模型（配置已自动写入 <code>~/.qoder-cn/settings.json</code>）。<br><br>
-					<b>QoderWork（对话式客户端）不受此限制</b>：其聊天链路已打通，可正常使用一键配置。
+				<div class="pathblock mitmblock">
+					<div class="pb-head"><span class="pb-title">为什么暂不可用</span></div>
+					<div class="mitm-note">
+						Qoder IDE 系的聊天推理在 <b>Qoder 云端</b>执行：请求发往官方网关、用你的 Qoder 登录态鉴权，
+						模型端点由服务端按「服务商」写死（服务商为固定的厂商列表，没有可填的地址项），
+						请求体还是加密的 —— 第三方中转既接不进去，本地也改不了。<br><br>
+						<b>可正常使用的是</b>：Qoder CN 桌面版、QoderWork（国际版 / 中国版），
+						以及 Trae 系 / CodeBuddy / WorkBuddy / ZCode / Cursor / Codex。
+					</div>
 				</div>
 			</div>
-		</div>
 	</div>`;
 		return;
 	}
