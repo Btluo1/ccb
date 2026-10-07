@@ -1,6 +1,6 @@
 {
   "name": "ccb-desktop",
-  "version": "1.0.18",
+  "version": "1.0.20",
   "description": "CCB - AI 编程助手一键配置工具",
   "main": "electron/main.js",
   "private": true,

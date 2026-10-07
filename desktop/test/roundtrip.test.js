@@ -15,7 +15,7 @@ const { CLIENTS } = require('../electron/lib/clients');
  * 需要断言「产品真实目录」的用例必须读这份模块加载时留下的快照。 */
 const ORIGINAL_CONFIG_DIRS = Object.fromEntries(CLIENTS.map((c) => [c.id, c.configDirs]));
 
-const { applyConfig, rollbackConfig, qoderWorkRow, qoderEncrypt, qoderDecrypt, saveGuiChoice, accountUidsUnder } = writers;
+const { applyConfig, rollbackConfig, qoderWorkRow, qoderEncrypt, qoderDecrypt, saveGuiChoice, accountUidsUnder, codexCatalogJson, codexCatalogWithout, codexCatalogIsOursOnly } = writers;
 
 const CFG = {
 	apiKey: 'sk-test-roundtrip-key',
@@ -60,6 +60,7 @@ const REAL_FILES = [
 	path.join(os.homedir(), '.workbuddy-ai', 'settings.json'),
 	path.join(os.homedir(), '.workbuddy-ai', 'ccb-workbuddy-gui.json'),
 	path.join(os.homedir(), '.codex', 'config.toml'),
+	path.join(os.homedir(), '.codex', 'models.json'),
 	path.join(os.homedir(), '.ccb', 'codex-apply.json'),
 ];
 
@@ -648,6 +649,7 @@ describe('Codex 桌面版写入（config.toml）', () => {
 	};
 	const ROOT = path.join(TMP, 'codex');
 	const FILE = path.join(ROOT, 'config.toml');
+	const CATALOG = path.join(ROOT, 'models.json');
 	const APPLY = path.join(TMP, 'codex-apply.json');
 	/* 用户现场快照：旧中转（激活）+ 另一条遗留 provider——正是新版 Codex 会拒绝加载的形态
 	 * （任一处 wire_api="chat" 都致命：2026-10-08 实测应用弹「Codex configuration could not
@@ -655,6 +657,12 @@ describe('Codex 桌面版写入（config.toml）', () => {
 	const SEED = [
 		'model_provider = "codeb"',
 		'model = "claude-sonnet-4-20250514"',
+		/* 用户自己的顶层键（Codex 桌面端会写 model_reasoning_effort / notify 这类顶层键）。
+		 * TOML 里表头之后的键属于该表，所以它们必须留在我们的 provider 表之前，否则会被
+		 * 吞进 [model_providers.ccb]（Codex 报「ignoring N unrecognized configuration
+		 * settings」，用户设置静默失效——2026-10-08 实机 doctor 取证）。 */
+		'model_reasoning_effort = "high"',
+		'notify = [ "hook.exe", "turn-ended" ]',
 		'',
 		'[model_providers.codeb]',
 		'name = "Codeb Relay"',
@@ -701,6 +709,8 @@ describe('Codex 桌面版写入（config.toml）', () => {
 			const text = fs.readFileSync(FILE, 'utf8');
 			expect(text).toContain('model_provider = "ccb"');
 			expect(text).toContain('model = "glm-5.3"');
+			/* 模型选择器的数据源：model_catalog_json 必须指向我们写的目录（正斜杠绝对路径） */
+			expect(text).toContain(`model_catalog_json = "${CATALOG.replace(/\\/g, '/')}"`);
 			expect(text).toContain('[model_providers.ccb]');
 			expect(text).toContain('base_url = "https://code.btluo.com/v1"');
 			/* 我们写的块（responses）+ 两处遗留 chat 的迁移：全文件不再残留 chat */
@@ -710,6 +720,15 @@ describe('Codex 桌面版写入（config.toml）', () => {
 			/* 顶层键只出现一次：旧的 model_provider/model 是替换掉的，不是追加 */
 			expect(text.match(/^model_provider\s*=/gm).length).toBe(1);
 			expect(text.match(/^model\s*=/gm).length).toBe(1);
+			/* 用户的其它顶层键必须留在我们的 provider 表之前，否则会被并入该表而失效 */
+			const iCcb = text.indexOf('[model_providers.ccb]');
+			expect(iCcb).toBeGreaterThan(-1);
+			expect(text.indexOf('model_reasoning_effort = "high"')).toBeLessThan(iCcb);
+			expect(text.indexOf('notify = [ "hook.exe", "turn-ended" ]')).toBeLessThan(iCcb);
+			/* 我们的 provider 表里只有我们写的键，没有混进用户顶层键 */
+			const ccbBody = text.slice(iCcb, text.indexOf('[model_providers.codeb]'));
+			expect(ccbBody).not.toContain('model_reasoning_effort');
+			expect(ccbBody).not.toContain('notify');
 			/* 除 wire_api 迁移外，用户原有内容一字不动（含段结构、键与行尾注释） */
 			expect(text).toContain('[model_providers.codeb]');
 			expect(text).toContain('name = "Codeb Relay"');
@@ -720,6 +739,125 @@ describe('Codex 桌面版写入（config.toml）', () => {
 			expect(text).toContain('notifications = true');
 
 			expect(JSON.parse(fs.readFileSync(APPLY, 'utf8')).model).toBe('glm-5.3');
+		} finally {
+			restore();
+		}
+	});
+
+	it('模型目录：必填字段齐全且 CCB 模型都在（缺任一项 Codex 会拒绝加载整份配置）', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			await applyConfig('codex', CFG3);
+			const data = JSON.parse(fs.readFileSync(CATALOG, 'utf8'));
+			expect(data.models.map((m) => m.slug)).toEqual(['glm-5.3', 'kimi-k2']);
+			for (const m of data.models) {
+				/* CLI 0.161.0 实测：support_verbosity / truncation_policy /
+				 * experimental_supported_tools / base_instructions 缺一即 missing field 报错 */
+				expect(typeof m.support_verbosity).toBe('boolean');
+				expect(m.truncation_policy).toBeTruthy();
+				expect(Array.isArray(m.experimental_supported_tools)).toBe(true);
+				expect(typeof m.base_instructions).toBe('string');
+				expect(m.base_instructions.length).toBeGreaterThan(0);
+				expect(m.model_messages.instructions_template).toBe(m.base_instructions);
+				expect(m.visibility).toBe('list');
+				expect(m.supported_in_api).toBe(true);
+				expect(m.context_window).toBeGreaterThan(0);
+				expect(m.max_context_window).toBeGreaterThan(0);
+			}
+		} finally {
+			restore();
+		}
+	});
+
+	it('模型目录：保留其它工具（如 DeepSeek 官方脚本）已有的条目，只增补我们的模型', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			fs.mkdirSync(ROOT, { recursive: true });
+			fs.writeFileSync(CATALOG, JSON.stringify({ models: [{ slug: 'deepseek-flash', display_name: 'DeepSeek-Flash' }] }, null, 2));
+			await applyConfig('codex', CFG3);
+			const slugs = JSON.parse(fs.readFileSync(CATALOG, 'utf8')).models.map((m) => m.slug);
+			expect(slugs).toContain('deepseek-flash');
+			expect(slugs).toContain('glm-5.3');
+			expect(slugs).toContain('kimi-k2');
+		} finally {
+			restore();
+		}
+	});
+
+	it('模型目录：二次写入内容稳定，.bak 恒为首次写入前的原始目录', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			fs.mkdirSync(ROOT, { recursive: true });
+			const ORIGINAL = JSON.stringify({ models: [{ slug: 'user-own', display_name: 'Own' }] }, null, 2);
+			fs.writeFileSync(CATALOG, ORIGINAL);
+			await applyConfig('codex', CFG3);
+			const first = fs.readFileSync(CATALOG, 'utf8');
+			await applyConfig('codex', CFG3);
+			expect(fs.readFileSync(CATALOG, 'utf8')).toBe(first);
+			expect(fs.readFileSync(CATALOG + '.bak', 'utf8')).toBe(ORIGINAL);
+		} finally {
+			restore();
+		}
+	});
+
+	it('回滚：目录原本不存在时被删除（不留我们新建的目录）', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			await applyConfig('codex', CFG3);
+			expect(fs.existsSync(CATALOG)).toBe(true);
+			await rollbackConfig('codex');
+			expect(fs.existsSync(CATALOG)).toBe(false);
+			expect(fs.readFileSync(FILE, 'utf8')).toBe(SEED);
+		} finally {
+			restore();
+		}
+	});
+
+	it('回滚（无备份兜底）：目录里其它工具的条目保留，只摘掉我们的模型', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			fs.mkdirSync(ROOT, { recursive: true });
+			fs.writeFileSync(CATALOG, JSON.stringify({ models: [{ slug: 'deepseek-flash', display_name: 'DeepSeek-Flash' }] }, null, 2));
+			await applyConfig('codex', CFG3);
+			fs.rmSync(FILE + '.bak');
+			fs.rmSync(CATALOG + '.bak');
+			await rollbackConfig('codex');
+			const slugs = JSON.parse(fs.readFileSync(CATALOG, 'utf8')).models.map((m) => m.slug);
+			expect(slugs).toEqual(['deepseek-flash']);
+			expect(fs.readFileSync(FILE, 'utf8')).not.toContain('model_catalog_json');
+		} finally {
+			restore();
+		}
+	});
+
+	it('目录纯函数：foreign 条目判定、摘除与合并', () => {
+		const ids = ['a', 'b'];
+		const mixed = JSON.stringify({ models: [{ slug: 'a' }, { slug: 'x' }] });
+		expect(codexCatalogIsOursOnly(mixed, ids)).toBe(false);
+		expect(codexCatalogIsOursOnly(JSON.stringify({ models: [{ slug: 'a' }] }), ids)).toBe(true);
+		expect(codexCatalogIsOursOnly('', ids)).toBe(true);
+		expect(codexCatalogWithout(mixed, ids)).toContain('"x"');
+		expect(codexCatalogWithout(mixed, ids)).not.toContain('"a"');
+		expect(codexCatalogWithout('not json', ids)).toBe(null);
+		const merged = JSON.parse(codexCatalogJson({ models: ['a'], defaultModel: 'a' }, mixed));
+		expect(merged.models.map((m) => m.slug)).toEqual(['x', 'a']);
+	});
+
+	it('模型列表取不到有效 id 时不写 model_catalog_json：空目录会被 Codex 拒绝加载（客户端直接起不来）', async () => {
+		const restore = restoreClient();
+		try {
+			writeSeed();
+			/* applyConfig 只校验数组非空，账号服务下发空 id（['']）时仍会走到写入器 */
+			const r = await applyConfig('codex', { ...CFG3, models: [''], defaultModel: '' });
+			expect(r.ok).toBe(true);
+			expect((r.log || []).join('\n')).toContain('跳过 Codex 模型目录');
+			expect(fs.readFileSync(FILE, 'utf8')).not.toContain('model_catalog_json');
+			expect(fs.existsSync(CATALOG)).toBe(false);
 		} finally {
 			restore();
 		}
@@ -737,6 +875,93 @@ describe('Codex 桌面版写入（config.toml）', () => {
 			expect(second).toBe(first);
 			expect(second.match(/\[model_providers\.ccb\]/g).length).toBe(1);
 			expect(fs.readFileSync(FILE + '.bak', 'utf8')).toBe(SEED);
+		} finally {
+			restore();
+		}
+	});
+
+	it('修复旧版遗留：被吞进 [model_providers.ccb] 的用户顶层键会被救回顶层', async () => {
+		const restore = restoreClient();
+		/* 旧版写入器产出的形态：用户的顶层键排在 provider 表之后，被 TOML 语义并入该表
+		 * （Codex 报「ignoring N unrecognized configuration settings」并忽略它们）。 */
+		const LEGACY = [
+			'model_provider = "ccb"',
+			'model = "glm-5.3"',
+			'',
+			'[model_providers.ccb]',
+			'name = "CCB"',
+			'base_url = "https://code.btluo.com/v1"',
+			'wire_api = "chat"',
+			'experimental_bearer_token = "sk-ccb-old"',
+			'',
+			'model_reasoning_effort = "low"',
+			'notify = [ "hook.exe", "turn-ended" ]',
+			'',
+			'[desktop]',
+			'followUpQueueMode = "steer"',
+			'',
+		].join('\n');
+		const writeLegacy = () => {
+			fs.mkdirSync(ROOT, { recursive: true });
+			fs.writeFileSync(FILE, LEGACY);
+		};
+		try {
+			writeLegacy();
+			await applyConfig('codex', CFG3);
+			const text = fs.readFileSync(FILE, 'utf8');
+			const iCcb = text.indexOf('[model_providers.ccb]');
+			expect(text.indexOf('model_reasoning_effort = "low"')).toBeLessThan(iCcb);
+			expect(text.indexOf('notify = [ "hook.exe", "turn-ended" ]')).toBeLessThan(iCcb);
+			expect(text).not.toContain('sk-ccb-old');
+			expect(text).toContain('[desktop]');
+
+			/* 兜底回滚同样要把救回的键留在顶层，不能随 provider 表一起删掉 */
+			fs.rmSync(FILE + '.bak');
+			await rollbackConfig('codex');
+			const after = fs.readFileSync(FILE, 'utf8');
+			expect(after).not.toContain('[model_providers.ccb]');
+			expect(after).toContain('model_reasoning_effort = "low"');
+			expect(after).toContain('notify = [ "hook.exe", "turn-ended" ]');
+		} finally {
+			restore();
+		}
+	});
+
+	it('救回时按键名去重：顶层已有同名键时不再重复写出（否则 TOML duplicate key 让配置整体加载失败）', async () => {
+		const restore = restoreClient();
+		/* 实测用户现场：notify 既在顶层，又被旧版吞进 [model_providers.ccb]。
+		 * 两份都救回顶层会写出重复键，Codex 直接报 invalid configuration（比 ignored 更致命）。 */
+		const DUP = [
+			'model_provider = "ccb"',
+			'model = "codeb-auto"',
+			'',
+			'notify = [ "hook.exe", "turn-ended" ]',
+			'[model_providers.ccb]',
+			'name = "CCB"',
+			'base_url = "https://code.btluo.com/v1"',
+			'wire_api = "responses"',
+			'experimental_bearer_token = "sk-ccb-old"',
+			'',
+			'model_reasoning_effort = "low"',
+			'notify = [ "hook.exe", "turn-ended" ]',
+			'',
+			'[desktop]',
+			'followUpQueueMode = "steer"',
+			'',
+		].join('\n');
+		try {
+			fs.mkdirSync(ROOT, { recursive: true });
+			fs.writeFileSync(FILE, DUP);
+			await applyConfig('codex', CFG3);
+			const text = fs.readFileSync(FILE, 'utf8');
+			/* notify 全文件只出现一次，且在 provider 表之前 */
+			expect(text.match(/^\s*notify\s*=/gm).length).toBe(1);
+			expect(text.indexOf('notify =')).toBeLessThan(text.indexOf('[model_providers.ccb]'));
+			/* 另一处被吞的键仍被救回顶层 */
+			expect(text.indexOf('model_reasoning_effort = "low"')).toBeLessThan(
+				text.indexOf('[model_providers.ccb]')
+			);
+			expect(text).not.toContain('sk-ccb-old');
 		} finally {
 			restore();
 		}
@@ -769,6 +994,9 @@ describe('Codex 桌面版写入（config.toml）', () => {
 			expect(text).not.toContain('model_provider = "ccb"');
 			expect(text).not.toContain('sk-ccb-codex-key');
 			expect(text).not.toContain('glm-5.3');
+			/* 用户自己的顶层键不受影响（既没被吞进我们的表，也没被回滚误删） */
+			expect(text).toContain('model_reasoning_effort = "high"');
+			expect(text).toContain('notify = [ "hook.exe", "turn-ended" ]');
 			expect(text).toContain('[model_providers.codeb]');
 			expect(text).toContain('[tui]');
 		} finally {
