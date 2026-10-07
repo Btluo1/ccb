@@ -649,6 +649,9 @@ describe('Codex 桌面版写入（config.toml）', () => {
 	const ROOT = path.join(TMP, 'codex');
 	const FILE = path.join(ROOT, 'config.toml');
 	const APPLY = path.join(TMP, 'codex-apply.json');
+	/* 用户现场快照：旧中转（激活）+ 另一条遗留 provider——正是新版 Codex 会拒绝加载的形态
+	 * （任一处 wire_api="chat" 都致命：2026-10-08 实测应用弹「Codex configuration could not
+	 * be loaded」、CLI 0.161.0 直接 exit 1）。写入器必须把两处都迁移成 responses。 */
 	const SEED = [
 		'model_provider = "codeb"',
 		'model = "claude-sonnet-4-20250514"',
@@ -658,6 +661,11 @@ describe('Codex 桌面版写入（config.toml）', () => {
 		'base_url = "https://code.btluo.com/v1"',
 		'wire_api = "chat"',
 		'env_key = "OPENAI_API_KEY"',
+		'',
+		'[model_providers.legacy]',
+		'name = "Legacy"',
+		'base_url = "https://legacy.example.com/v1"',
+		"wire_api = 'chat'  # 单引号 + 行尾注释",
 		'',
 		'[tui]',
 		'notifications = true',
@@ -682,27 +690,32 @@ describe('Codex 桌面版写入（config.toml）', () => {
 		fs.writeFileSync(FILE, SEED);
 	};
 
-	it('写入：顶层指向 ccb、密钥内联，用户自己的 provider 与其它表原样保留', async () => {
+	it('写入：顶层指向 ccb、密钥内联；遗留 provider 的 wire_api = chat 全部迁移为 responses，其它内容原样保留', async () => {
 		const restore = restoreClient();
 		try {
 			writeSeed();
 			const r = await applyConfig('codex', CFG3);
 			expect(r.ok).toBe(true);
+			expect((r.log || []).join('\n')).toContain('迁移为 "responses"');
 
 			const text = fs.readFileSync(FILE, 'utf8');
 			expect(text).toContain('model_provider = "ccb"');
 			expect(text).toContain('model = "glm-5.3"');
 			expect(text).toContain('[model_providers.ccb]');
 			expect(text).toContain('base_url = "https://code.btluo.com/v1"');
-			expect(text).toContain('wire_api = "chat"');
+			/* 我们写的块（responses）+ 两处遗留 chat 的迁移：全文件不再残留 chat */
+			expect((text.match(/^\s*wire_api\s*=\s*"responses"/gm) || []).length).toBe(3);
+			expect(text).not.toMatch(/wire_api\s*=\s*['"]chat['"]/i);
 			expect(text).toContain('experimental_bearer_token = "sk-ccb-codex-key"');
 			/* 顶层键只出现一次：旧的 model_provider/model 是替换掉的，不是追加 */
 			expect(text.match(/^model_provider\s*=/gm).length).toBe(1);
 			expect(text.match(/^model\s*=/gm).length).toBe(1);
-			/* 用户原有内容一字不动 */
+			/* 除 wire_api 迁移外，用户原有内容一字不动（含段结构、键与行尾注释） */
 			expect(text).toContain('[model_providers.codeb]');
 			expect(text).toContain('name = "Codeb Relay"');
 			expect(text).toContain('env_key = "OPENAI_API_KEY"');
+			expect(text).toContain('[model_providers.legacy]');
+			expect(text).toContain('wire_api = "responses"  # 单引号 + 行尾注释');
 			expect(text).toContain('[tui]');
 			expect(text).toContain('notifications = true');
 

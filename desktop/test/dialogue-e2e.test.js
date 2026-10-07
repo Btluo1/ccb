@@ -15,7 +15,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
  *   applyConfig（写入临时目录）
  *     → 按「客户端自己读配置的方式」读回服务端点 + API Key + 默认模型
  *     → GET  /v1/models          （客户端启动拉模型列表）
- *     → POST /v1/chat/completions（真实发起一次对话）
+ *     → POST /v1/chat/completions（真实发起一次对话；Codex 桌面版按新版 core 走 Responses API → /v1/responses）
  *     → 断言鉴权、模型、回复全部正确
  *
  * 覆盖全部 8 个文件型写入器（traeui 系除外：它必须 CDP 驱动真实客户端 UI，
@@ -73,6 +73,23 @@ function startRelay() {
 							{ index: 0, message: { role: 'assistant', content: REPLY }, finish_reason: 'stop' },
 						],
 						usage: { prompt_tokens: 12, completion_tokens: 9, total_tokens: 21 },
+					});
+				} else if (req.method === 'POST' && req.url === '/v1/responses') {
+					/* Codex 桌面版按新版 core 走 Responses API（wire_api = "responses"）：最小可用形状 */
+					send(200, {
+						id: 'resp-ccb-e2e',
+						object: 'response',
+						status: 'completed',
+						output: [
+							{
+								id: 'msg-ccb-e2e',
+								type: 'message',
+								role: 'assistant',
+								status: 'completed',
+								content: [{ type: 'output_text', text: REPLY, annotations: [] }],
+							},
+						],
+						usage: { input_tokens: 12, output_tokens: 9, total_tokens: 21 },
 					});
 				} else {
 					send(404, { error: { message: 'Not Found' } });
@@ -197,8 +214,8 @@ const READERS = {
 		};
 	},
 	/* Codex 桌面版：~/.codex/config.toml（顶层 model_provider/model + [model_providers.ccb]）。
-	 * 按 codex core 的读法取值：base_url + /chat/completions（wire_api=chat）、
-	 * experimental_bearer_token 作 Authorization。 */
+	 * 按新版 codex core 的读法取值：wire_api = "responses" → base_url + /responses、
+	 * experimental_bearer_token 作 Authorization（chat 已被移除，写 chat 的配置加载即失败）。 */
 	codex: () => {
 		const text = fs.readFileSync(path.join(TMP, 'codex', 'config.toml'), 'utf8');
 		const pick = (key) => {
@@ -206,12 +223,39 @@ const READERS = {
 			return m && m[1];
 		};
 		expect(text).toMatch(/^\s*model_provider\s*=\s*"ccb"\s*$/m);
+		expect(text).toMatch(/^\s*wire_api\s*=\s*"responses"\s*$/m);
 		return {
-			endpoint: pick('base_url') + '/chat/completions',
+			endpoint: pick('base_url') + '/responses',
 			apiKey: pick('experimental_bearer_token'),
 			model: pick('model'),
 		};
 	},
+};
+
+/* 各客户端的对话协议：默认走 OpenAI chat/completions；Codex 桌面版例外——新版 core 只支持
+ * Responses API（config.toml 里 wire_api = "responses"），请求体与回复形状都不同。 */
+const DIALOGUE = {
+	codex: {
+		path: '/v1/responses',
+		/* 最小可用请求体（真实 core 会附 instructions/tools/stream 等完整字段） */
+		body: (model) => ({
+			model,
+			input: [{ type: 'message', role: 'user', content: '你好，请回复确认。' }],
+			stream: false,
+		}),
+		reply: (payload) => payload.output[0].content[0].text,
+		userText: (body) => body.input[0].content,
+	},
+};
+const DEFAULT_DIALOGUE = {
+	path: '/v1/chat/completions',
+	body: (model) => ({
+		model,
+		messages: [{ role: 'user', content: '你好，请回复确认。' }],
+		stream: false,
+	}),
+	reply: (payload) => payload.choices[0].message.content,
+	userText: (body) => body.messages[0].content,
 };
 
 /* 各客户端写入前的环境铺垫（模拟「已安装并启动过一次」的现场） */
@@ -312,6 +356,7 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 				try {
 				seedClient(id);
 				const c = cfg();
+				const d = DIALOGUE[id] || DEFAULT_DIALOGUE;
 
 				/* 1. 一键配置写入 */
 				const r = await applyConfig(id, c);
@@ -319,7 +364,7 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 
 				/* 2. 按客户端读取配置的方式读回 */
 				const { endpoint, apiKey, model } = READERS[id]();
-				expect(endpoint).toBe(`http://127.0.0.1:${port}/v1/chat/completions`);
+				expect(endpoint).toBe(`http://127.0.0.1:${port}${d.path}`);
 				expect(apiKey).toBe(c.apiKey);
 				expect(model).toBe(c.defaultModel);
 
@@ -337,21 +382,18 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 				const chatRes = await fetch(endpoint, {
 					method: 'POST',
 					headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-					body: JSON.stringify({
-						model,
-						messages: [{ role: 'user', content: '你好，请回复确认。' }],
-						stream: false,
-					}),
+					body: JSON.stringify(d.body(model)),
 				});
 				expect(chatRes.status).toBe(200);
 				const chat = await chatRes.json();
-				expect(chat.choices[0].message.content).toBe(REPLY);
+				expect(d.reply(chat)).toBe(REPLY);
 
 				/* 5. 中转站侧收到正确的鉴权、模型与消息 */
 				expect(relayRequests).toHaveLength(1);
+				expect(relayRequests[0].path).toBe(d.path);
 				expect(relayRequests[0].auth).toBe(`Bearer ${c.apiKey}`);
 				expect(relayRequests[0].body.model).toBe(c.defaultModel);
-				expect(relayRequests[0].body.messages[0].content).toBe('你好，请回复确认。');
+				expect(d.userText(relayRequests[0].body)).toBe('你好，请回复确认。');
 			} finally {
 				if (id === 'qoderwork-cn') {
 					if (savedBridge === undefined) delete process.env.CCB_QW_BRIDGE;

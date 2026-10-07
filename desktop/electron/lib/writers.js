@@ -1817,10 +1817,27 @@ async function rollbackZCode(log, client, detected) {
  *      这里取 b：密钥跟着配置文件走，回滚 = 还原 .bak，没有全局副作用。
  *   4) 绝不写 ~/.codex/auth.json：那是 ChatGPT 账号登录凭据，覆盖会破坏用户登录态。
  * 默认模型：config.toml 只有一个 model 字段（没有多模型列表的概念），写 cfg.defaultModel。
+ *
+ * 2026-10-08 补充（应用自动升级到 v26.1002.7124.0；core 同代 CLI 0.161.0 实测）：
+ *   1) wire_api 只能写 "responses"：chat/completions 已被 OpenAI 移除，含 chat 的配置在
+ *      加载期硬报错（「'wire_api = "chat"' is no longer supported. How to fix: set
+ *      wire_api = "responses"」，应用弹「Codex configuration could not be loaded」拒绝启动，
+ *      官方公告见 discussions/7782）。
+ *   2) 校验覆盖**全部** provider 表，不光是当前激活的供应商：配置里任何一处遗留的
+ *      wire_api = "chat"（例如未激活的旧中转条目）都会让整份配置加载失败（CLI 实测 exit 1，
+ *      报错定位到 model_providers.<旧 id>.wire_api）。因此写入时必须把用户其它 provider 表
+ *      里遗留的 chat 一并迁移为 responses，否则「打开即用」不成立——这些条目在新版 Codex
+ *      里本来也无法再被使用；缺省 wire_api 的条目实测不报错，保持原样不动。
+ *      experimental_bearer_token 在新 core 二进制里仍然存在，密钥内联方案不变。
+ *   3) CCB 网关 /v1/responses 端点已上线：2026-10-08 实测 /v1/models 返回 200、
+ *      /v1/responses 携带 Key 的请求已进入上游路由（当时上游池 503 属运营问题），
+ *      Codex 走 responses 的链路成立。
  */
 const CODEX_PROVIDER_ID = 'ccb';
 const CODEX_PROVIDER_NAME = 'CCB';
 const CODEX_PROVIDER_HEADER = /^\s*\[\s*model_providers\s*\.\s*"?ccb"?\s*\]\s*$/i;
+/* 旧版 chat wire_api 行（新版 Codex 硬拒绝；值区分单双引号，允许行尾注释） */
+const CODEX_CHAT_WIRE_API_RE = /^(\s*wire_api\s*=\s*)(["'])chat\2(\s*(?:#.*)?)$/i;
 /* 写入参数持久化（回滚时用来精准摘掉我们写的 model 行） */
 const CODEX_APPLY_FILE = () => path.join(HOME, '.ccb', 'codex-apply.json');
 
@@ -1842,7 +1859,7 @@ function codexBlock(cfg) {
 		`[model_providers.${CODEX_PROVIDER_ID}]`,
 		`name = "${CODEX_PROVIDER_NAME}"`,
 		`base_url = "${base}"`,
-		'wire_api = "chat"',
+		'wire_api = "responses"', /* 新版 Codex 已移除 chat：只认 responses，见上方 2026-10-08 取证 */
 		`experimental_bearer_token = "${cfg.apiKey}"`,
 	].join('\n');
 }
@@ -1878,7 +1895,9 @@ function dropTopLevelLines(lines, hit) {
 }
 
 /**
- * 行级合并 config.toml：保留用户其它键与其它 provider，只替换我们这套。
+ * 行级合并 config.toml：保留用户其它键与其它 provider，只替换我们这套；
+ * 顺带把其它 provider 表里遗留的 wire_api = "chat" 迁移为 "responses"
+ * （新版 Codex 校验全部 provider，任一处 chat 都会让配置整体加载失败，详见上方取证）。
  * 纯函数（不碰文件系统），便于测试。
  */
 function mergeCodexToml(text, cfg) {
@@ -1887,6 +1906,10 @@ function mergeCodexToml(text, cfg) {
 	let lines = raw.replace(/\r\n/g, '\n').split('\n');
 	lines = dropCodexProviderTable(lines);
 	lines = dropTopLevelLines(lines, (l) => /^\s*(model_provider|model)\s*=/.test(l));
+	lines = lines.map((line) => {
+		const m = CODEX_CHAT_WIRE_API_RE.exec(line);
+		return m ? `${m[1]}"responses"${m[3]}` : line;
+	});
 	while (lines.length && !lines[0].trim()) lines.shift();
 	const body = lines.join('\n').replace(/\n+$/, '');
 	const out = codexBlock(cfg) + '\n' + (body ? '\n' + body + '\n' : '');
@@ -1918,6 +1941,10 @@ async function writeCodex(cfg, log, client) {
 	backupOnce(file, log);
 	const before = fs.existsSync(file) ? readText(file) : '';
 	writeText(file, mergeCodexToml(before, cfg));
+	const legacyChat = before.split(/\r?\n/).filter((l) => CODEX_CHAT_WIRE_API_RE.test(l)).length;
+	if (legacyChat) {
+		log(`已将 ${legacyChat} 处遗留的 wire_api = "chat" 迁移为 "responses"（新版 Codex 不再支持 chat，任一处都会导致客户端无法启动）`);
+	}
 	const model = cfg.defaultModel || (cfg.models && cfg.models[0]) || '';
 	log(`已写入 ${file}（供应商 ${CODEX_PROVIDER_ID} → ${String(cfg.apiBase || '').replace(/\/+$/, '')}，默认模型 ${model}）`);
 
