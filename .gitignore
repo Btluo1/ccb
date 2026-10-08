@@ -63,4 +63,5 @@ qoder-cn-proxy.cmd
 # ---- 图片：默认忽略，放行开源端自有资源 ----
 *.png
 !desktop/renderer/icons/*.png
+!desktop/renderer/qr/*.png
 !desktop/build/*.png
