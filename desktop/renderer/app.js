@@ -485,14 +485,14 @@ async function applyAll() {
 		});
 		const text = (r.log || []).concat(r.ok ? [] : [r.error || '写入失败']).join('\n');
 			state.lastLog[c.id] = { ok: !!r.ok, text };
-			state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, launch: null };
+			state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: null };
 			state.running[c.id] = false;
 			renderClients();
 		}
 
 		/* 6. 启动 / 重启全部选中客户端 */
 		for (const c of selected) {
-			if (!state.results[c.id]) state.results[c.id] = { ok: null, text: '', launch: null };
+			if (!state.results[c.id]) state.results[c.id] = { ok: null, text: '', error: null, launch: null };
 			const l = await window.ccb.launchClient(c.id);
 			state.results[c.id].launch = l;
 			renderClients();
@@ -502,7 +502,10 @@ async function applyAll() {
 	const doneNames = selected.filter((c) => state.results[c.id] && state.results[c.id].ok).map((c) => c.name);
 	const needLoginNames = selected.filter((c) => {
 		const r = state.results[c.id] || {};
-		return clientLoginReq(c) && (!r.ok || r.warning);
+		if (!clientLoginReq(c)) return false;
+		/* 失败 ≠ 未登录：只有错误明说未登录才提醒登录，其余失败交给摘要区的真实原因 */
+		if (r.ok === false) return /未登录/.test(r.error || '');
+		return !!r.warning;
 	}).map((c) => c.name);
 	const warnN = selected.filter((c) => {
 		const r = state.results[c.id] || {};
@@ -550,9 +553,20 @@ function nextStepsHtml(c) {
 	const name = esc(c.name + (c.variant ? ' · ' + c.variant : ''));
 	const login = clientLoginReq(c);
 
-	/* 1) 写入失败：Trae 系 / WorkBuddy 基本都是「客户端还没登录」 */
+	/* 1) 写入失败：错误明说「未登录」才给登录指引（Trae 系 / WorkBuddy 的主因）；
+	 * 其余失败（超时 / 界面没就绪 / 提交被拦）给真实原因与重试指引，
+	 * 免得已登录的用户被「请先登录」误导 */
 	if (!r.ok) {
 		if (!login) return '';
+		if (!/未登录/.test(r.error || '')) {
+			return `<div class="as-steps fail">
+				<div class="as-steps-head">${ICON_WARN}<span><b>${name}</b> 配置未完成：${esc(r.error || '未知原因')}</span></div>
+				<ol class="as-steps-list">
+					<li>稍等片刻后回到本窗口，重新点一次「一键配置并启动」。</li>
+					<li>多次失败：点开「详情」查看日志，把日志内容反馈给我们排查。</li>
+				</ol>
+			</div>`;
+		}
 		return `<div class="as-steps fail">
 			<div class="as-steps-head">${ICON_WARN}<span><b>${name}</b> 还差一步：先在客户端登录，再回来重新配置</span></div>
 			<ol class="as-steps-list">
@@ -977,11 +991,11 @@ async function applyOne(c) {
 	});
 	const text = (r.log || []).concat(r.ok ? [] : [r.error || '写入失败']).join('\n');
 	state.lastLog[c.id] = { ok: !!r.ok, text };
-	state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, launch: (state.results[c.id] || {}).launch || null };
+	state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: (state.results[c.id] || {}).launch || null };
 	renderClients();
 	renderPanel();
 	showSummary([c]);
-	const needLogin = clientLoginReq(c) && (!r.ok || r.warning);
+	const needLogin = clientLoginReq(c) && (r.ok === false ? /未登录/.test(r.error || '') : !!r.warning);
 	if (needLogin) {
 		toast(`${c.name} 还差一步：先在客户端登录，再回来重新配置`);
 	} else if (r.ok && r.warning) {

@@ -20,7 +20,8 @@
  *   `use_remote_service: false` 表示请求由客户端本地发起，故自建地址无需公网可达。
  *
  * 约束：
- *   - 客户端必须已登录 Trae 账号（未登录时界面上没有模型选择器，会明确报错）
+ *   - 客户端必须已登录 Trae 账号（未登录时界面上没有模型选择器，会明确报错；
+ *     注意冷启动时顶栏会先短暂渲染「登录」按钮再恢复会话，判定要防抖，见 waitForWorkbench）
  *   - 启动期间不能已有同产品实例在跑（单实例，新进程只会激活旧窗口，不会开调试端口）
  *   - 界面结构由 Trae 版本决定，选择器全部集中在下面 SEL 常量里，便于版本变更时修
  */
@@ -130,27 +131,33 @@ class Cdp {
 		});
 	}
 
+	static async listPages(port) {
+		const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(4000) });
+		const list = await res.json();
+		return (Array.isArray(list) ? list : []).filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+	}
+
+	static async open(wsUrl) {
+		const ws = new WebSocket(wsUrl);
+		await new Promise((resolve, reject) => {
+			ws.addEventListener('open', resolve, { once: true });
+			ws.addEventListener('error', () => reject(new Error('调试通道连接失败')), { once: true });
+			setTimeout(() => reject(new Error('调试通道连接超时')), 8000);
+		});
+		const cdp = new Cdp(ws);
+		await cdp.send('Runtime.enable', {});
+		await cdp.send('Page.enable', {});
+		return cdp;
+	}
+
 	static async connect(port, timeoutMs) {
 		if (typeof WebSocket !== 'function') throw new Error('当前运行时缺少 WebSocket 支持');
 		const deadline = Date.now() + timeoutMs;
 		let lastErr = '等待客户端启动';
 		while (Date.now() < deadline) {
 			try {
-				const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(4000) });
-				const list = await res.json();
-				const page = list.find((t) => t.type === 'page');
-				if (page && page.webSocketDebuggerUrl) {
-					const ws = new WebSocket(page.webSocketDebuggerUrl);
-					await new Promise((resolve, reject) => {
-						ws.addEventListener('open', resolve, { once: true });
-						ws.addEventListener('error', () => reject(new Error('调试通道连接失败')), { once: true });
-						setTimeout(() => reject(new Error('调试通道连接超时')), 8000);
-					});
-					const cdp = new Cdp(ws);
-					await cdp.send('Runtime.enable', {});
-					await cdp.send('Page.enable', {});
-					return cdp;
-				}
+				const pages = await Cdp.listPages(port);
+				if (pages.length) return await Cdp.open(pages[0].webSocketDebuggerUrl);
 				lastErr = '客户端主窗口尚未就绪';
 			} catch (e) {
 				lastErr = e.message || String(e);
@@ -356,17 +363,69 @@ async function waitFor(cdp, expr, timeoutMs, what) {
 	}
 }
 
-/** 轮询多个表达式，返回先为真的那个（等页面出现两种互斥状态之一，如「模型选择器」或「登录按钮」） */
-async function waitForAny(cdp, exprs, timeoutMs, what) {
-	const deadline = Date.now() + timeoutMs;
+/** 等主界面（模型选择器）就绪，同时防两类「已登录却被判失败」的误判：
+ *  1) 冷启动竞态：客户端被我们重启后，顶栏会先渲染「登录」按钮，会话恢复后才换成头像；
+ *     若把「登录按钮出现了一瞬」当定论，登录用户会被误报未登录（慢机器/慢网络必现）。
+ *     因此登录按钮只在**持续**存在（默认 30 秒）时才判未登录，瞬时出现一律继续等选择器。
+ *  2) 调试目标失活：启动瞬间的 splash 窗口也是 page 目标，先连上它的话窗口一关、
+ *     求值就开始逐条超时。检测到 socket 断开就换下一个未连过的 page 目标重连。
+ * @returns {Promise<{cdp:Cdp, error?:string}>} error 非空表示失败（含未登录与超时两种文案）
+ */
+async function waitForWorkbench(cdp, port, label, log, opts = {}) {
+	const deadlineMs = opts.deadlineMs || 120000;
+	const loginGraceMs = opts.loginGraceMs || 30000;
+	const pollMs = opts.pollMs || 500;
+	const notLoggedIn = () => ({ cdp, error: `${label} 未登录，请先登录后重新配置` });
+	const tried = new Set([cdp.ws.url]);
+	const deadline = Date.now() + deadlineMs;
+	let loginSince = 0;
 	for (;;) {
-		for (const expr of exprs) {
+		/* socket 已断开：换一个没连过的 page 目标（比如 splash 关掉后露出的主窗口） */
+		if (cdp.ws.readyState !== 1) {
+			let next = null;
 			try {
-				if (await cdp.evaluate(expr)) return expr;
+				const pages = await Cdp.listPages(port);
+				next = pages.find((p) => !tried.has(p.webSocketDebuggerUrl)) || null;
 			} catch {}
+			if (next) {
+				/* 先记账再连接：连不上也不重复试同一个目标 */
+				tried.add(next.webSocketDebuggerUrl);
+				try {
+					cdp = await Cdp.open(next.webSocketDebuggerUrl);
+					loginSince = 0;
+					log('调试目标已失效，改连客户端另一个窗口…');
+				} catch {}
+			}
+			/* 换不成（客户端还在出窗口 / 已退出）：干等会白烧 20 秒/次的求值超时，睡一秒再试 */
+			if (cdp.ws.readyState !== 1) {
+				if (Date.now() >= deadline) {
+					return { cdp, error: `${label} 主界面一直没就绪：客户端窗口未能通过调试通道响应，请重试` };
+				}
+				await sleep(1000);
+				continue;
+			}
 		}
-		if (Date.now() >= deadline) throw new Error(`等待「${what}」超时`);
-		await sleep(400);
+		let triggered = false;
+		try { triggered = !!(await cdp.evaluate(RECT_TRIGGER)); } catch {}
+		if (triggered) return { cdp };
+		let login = false;
+		try { login = !!(await cdp.evaluate(LOGIN_VISIBLE)); } catch {}
+		if (login) {
+			if (!loginSince) {
+				loginSince = Date.now();
+				log(`看到「登录」按钮，先等 ${label} 恢复登录会话（冷启动时顶栏会短暂显示登录态）…`);
+			} else if (Date.now() - loginSince >= loginGraceMs) {
+				log(`「登录」按钮持续 ${Math.round(loginGraceMs / 1000)} 秒未消失，判定 ${label} 未登录。`);
+				return notLoggedIn();
+			}
+		} else {
+			/* 按钮消失 = 会话恢复完成，重新计时 */
+			loginSince = 0;
+		}
+		if (Date.now() >= deadline) {
+			return loginSince ? notLoggedIn() : { cdp, error: `${label} 主界面等待超时：模型选择器一直没出现，请确认客户端窗口已打开后重试` };
+		}
+		await sleep(pollMs);
 	}
 }
 
@@ -379,8 +438,12 @@ async function openModelSettings(cdp, log) {
 
 	let opened = false;
 	for (let i = 0; i < 3 && !opened; i++) {
-		const trig = await cdp.evaluate(RECT_TRIGGER);
-		if (!trig) throw new Error('界面上找不到模型选择器，请确认客户端已登录并打开主界面');
+		/* 选择器可能因界面重渲染瞬时缺席：轮询等它回来，而不是一票否决 */
+		let trig = null;
+		try {
+			trig = await waitForRect(cdp, RECT_TRIGGER, i === 0 ? 20000 : 5000, '模型选择器');
+		} catch {}
+		if (!trig) throw new Error('界面上找不到模型选择器，请确认客户端已打开主界面后重试');
 		const { x, y } = JSON.parse(trig);
 		await cdp.clickAt(x, y);
 		await sleep(1400);
@@ -501,8 +564,16 @@ async function selectModel(cdp, displayName, log) {
 	 * 后 30 秒内菜单一条 CCB 都没有） */
 	const deadline = Date.now() + 60000;
 	for (let attempt = 0; attempt < 3; attempt++) {
-		const trig = await cdp.evaluate(RECT_TRIGGER);
-		if (!trig) throw new Error('界面上找不到模型选择器');
+		/* 模型全部添加完成后，任何一步失败都不该把整个配置判为失败：
+		 * 选择器瞬时缺席（设置页关闭后的重渲染）只降级为「请手动选一次」 */
+		let trig = null;
+		try {
+			trig = await waitForRect(cdp, RECT_TRIGGER, 15000, '模型选择器');
+		} catch {}
+		if (!trig) {
+			log('模型选择器暂时不可见，跳过默认模型切换。');
+			return false;
+		}
 		const t = JSON.parse(trig);
 		await cdp.clickAt(t.x, t.y);
 		await sleep(1400);
@@ -565,12 +636,10 @@ async function addCustomModels({ exePath, exeNames, label, cfg, log }) {
 	let cdp = null;
 	try {
 		cdp = await Cdp.connect(port, 120000);
-		/* 主界面出现前同时盯「登录」按钮：未登录时模型选择器永远不会出现，
-		 * 早发现早报错，别让用户干等 120 秒再看到一条超时 */
-		const first = await waitForAny(cdp, [RECT_TRIGGER, LOGIN_VISIBLE], 120000, '主界面');
-		if (first === LOGIN_VISIBLE) {
-			log(`检测到 ${label} 未登录：自定义模型保存在账号里，登录后才能写入。`);
-			return { ok: false, error: `${label} 未登录，请先登录后重新配置` };
+		const wb = await waitForWorkbench(cdp, port, label, log);
+		cdp = wb.cdp; /* 等待期间可能已改连别的窗口，后续步骤要用新的连接 */
+		if (wb.error) {
+			return { ok: false, error: wb.error };
 		}
 
 		await openModelSettings(cdp, log);
@@ -623,4 +692,4 @@ async function addCustomModels({ exePath, exeNames, label, cfg, log }) {
 /** 展示名加 CCB 前缀：Trae 的模型列表里混着同名预置模型，不区分会看不懂 */
 const displayNameOf = (modelId) => `CCB ${modelId}`;
 
-module.exports = { addCustomModels, displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForAny, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE, openModelSettings, readExisting, addOne, selectModel };
+module.exports = { addCustomModels, displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE, openModelSettings, readExisting, addOne, selectModel };
