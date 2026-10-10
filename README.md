@@ -94,7 +94,7 @@ CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工�
 <details>
 <summary>Codex 桌面版（开始菜单里叫「ChatGPT」）会改写我的 ChatGPT 账号吗？</summary>
 
-不会。CCB 只写 `~/.codex/config.toml`：把默认供应商指向 `[model_providers.ccb]`，密钥内联在该条目里。`~/.codex/auth.json`（ChatGPT 登录凭据）完全不动，应用要求登录时用你自己的账号登录即可。回滚会把 `config.toml` 还原成配置前的样子。
+不会。CCB 只写 `~/.codex/config.toml`：把默认供应商指向 `[model_providers.ccb]`（`wire_api = "responses"`），密钥内联在该条目里；并把其它供应商条目里遗留的 `wire_api = "chat"` 一并迁移为 `"responses"`（新版 Codex 已移除 chat，配置里只要剩一条就会拒绝启动）。`~/.codex/auth.json`（ChatGPT 登录凭据）完全不动，应用要求登录时用你自己的账号登录即可。回滚会把 `config.toml` 还原成配置前的样子。
 </details>
 
 <details>
