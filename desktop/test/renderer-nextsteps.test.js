@@ -18,7 +18,7 @@ const appJs = fs.readFileSync(path.join(here, '..', 'renderer', 'app.js'), 'utf8
 
 const CLIENTS = {
 	'trae-cn': {
-		id: 'trae-cn', name: 'TraeCode', variant: '中国版', vendor: '字节跳动',
+		id: 'trae-cn', name: 'TRAE CN', variant: '', vendor: '字节跳动',
 		writer: 'traeui', provider: 'openai', installed: true, evidence: [], details: {},
 	},
 	'wb-cn': {
@@ -116,7 +116,7 @@ describe('一键配置完成后的后续步骤提示', () => {
 		const dom = await mount('trae-cn', {
 			ok: false,
 			log: ['开始写入自定义模型…'],
-			error: 'TraeCode 未登录，请先登录后重新配置',
+			error: 'TRAE CN 未登录，请先登录后重新配置',
 		});
 		const summary = await applyAll(dom);
 		const box = await waitFor(() => summary.querySelector('.as-steps.fail'));
@@ -130,8 +130,8 @@ describe('一键配置完成后的后续步骤提示', () => {
 	it('Trae 系非未登录失败（如主界面超时）：显示真实原因与重试指引，不再误导已登录的用户去登录', async () => {
 		const dom = await mount('trae-cn', {
 			ok: false,
-			log: ['正在以调试模式启动 TraeCode…', '看到「登录」按钮，先等 TraeCode 恢复登录会话…'],
-			error: 'TraeCode 主界面等待超时：模型选择器一直没出现，请确认客户端窗口已打开后重试',
+			log: ['正在以调试模式启动 TRAE CN…', '看到「登录」按钮，先等 TRAE CN 恢复登录会话…'],
+			error: 'TRAE CN 主界面等待超时：模型选择器一直没出现，请确认客户端窗口已打开后重试',
 		});
 		const summary = await applyAll(dom);
 		const box = await waitFor(() => summary.querySelector('.as-steps.fail'));

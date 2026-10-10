@@ -19,7 +19,7 @@
 CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工具：登录 CCB 账号后，选中你已经安装的客户端，点一次按钮即可完成全部接入配置。
 
 - **一键配置并启动**：自动获取平台密钥 → 批量写入全部可用模型 → 设为当前模型 → 启动客户端（运行中的自动重启）。
-- **覆盖主流客户端**：Trae / TraeCode / TraeWork、Qoder CN 桌面版 / QoderWork、CodeBuddy、WorkBuddy、ZCode、Cursor、Codex，共 13 个客户端或版本。
+- **覆盖主流客户端**：TRAE CN / Trae / TraeWork、Qoder CN 桌面版 / QoderWork、CodeBuddy、WorkBuddy、ZCode、Cursor、Codex，共 12 个客户端或版本。
 - **全部模型按官方定价 2 折计费**，按输入 / 输出 token 用量从余额扣费；兑换卡充值即时到账。
 - **随时可回滚**：写入前自动备份原配置（`*.bak`），在「详情」里一键恢复原样。
 - **内置帮助文档**：客户端底部「遇到问题？」帮助区，常见问题支持关键词搜索、断网可用。
@@ -35,8 +35,8 @@ CCB 桌面端是一个面向 Windows 的「AI 编程客户端一键配置」工�
 | 客户端 | 版本 | 接入方式 | 使用须知 |
 | --- | --- | --- | --- |
 | Trae | 国际版 | 官方自定义模型（写入 Trae 账号） | 需先在客户端登录 |
-| TraeCode | 中国版 | 官方自定义模型（写入 Trae 账号） | 需先在客户端登录 |
-| TraeWork | 国际版 / 中国版 | 官方自定义模型（与 Trae 共用账号） | 需先在客户端登录 |
+| TRAE CN | 中国版（官方 3.4 更新起，原 TraeCode CN 与 TraeWork CN 合并为此客户端） | 官方自定义模型（写入 Trae 账号） | 需先在客户端登录 |
+| TraeWork | 国际版 | 官方自定义模型（与 Trae 共用账号） | 需先在客户端登录 |
 | Qoder CN | 桌面版 | 本地 worker 桥接 | 打开即用 |
 | QoderWork | 国际版 / 中国版 | 本地 worker 桥接 | 首次需在客户端登录一次 |
 | CodeBuddy | 中国版 | 写入模型配置 + 工作区选中模型 | 打开即用 |

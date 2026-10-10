@@ -1,4 +1,4 @@
-import net from 'node:net';
+﻿import net from 'node:net';
 import { createRequire } from 'node:module';
 import { describe, it, expect } from 'vitest';
 
@@ -66,18 +66,24 @@ describe('Trae UI 自动化：「完整 URL」开关归一化', () => {
 });
 
 describe('Trae UI 自动化：写入器接线', () => {
-	it('四个 Trae 客户端都指向 traeui 写入器', () => {
+	it('Trae 系客户端都指向 traeui 写入器（CN 两客户端已合并为 TRAE CN 单条目）', () => {
 		const { CLIENTS } = require('../electron/lib/clients');
 		const traes = CLIENTS.filter((c) => /^trae/.test(c.id));
-		expect(traes).toHaveLength(4);
+		expect(traes.map((c) => c.id)).toEqual(['trae-intl', 'trae-cn', 'traework-intl']);
 		for (const c of traes) {
 			expect(c.writer).toBe('traeui');
 		}
+		/* 合并后的 TRAE CN：沿用 TraeCode CN 的安装目录 / exe / 数据目录 */
+		const cn = traes.find((c) => c.id === 'trae-cn');
+		expect(cn.name).toBe('TRAE CN');
+		expect(cn.appDirs).toEqual(['Trae CN']);
+		expect(cn.exeNames).toEqual(['Trae CN.exe', 'TRAE CN.exe']);
+		expect(cn.homeDir).toBe('.trae-cn');
 	});
 
 	it('拿不到程序路径时给出明确提示，而不是抛异常（曾经漏导出 findLaunchExe）', async () => {
 		const { applyConfig } = require('../electron/lib/writers');
-		const r = await applyConfig('traework-cn', { apiKey: 'sk-ccb-x', apiBase: 'https://x/v1', models: ['m'] }, {});
+		const r = await applyConfig('trae-cn', { apiKey: 'sk-ccb-x', apiBase: 'https://x/v1', models: ['m'] }, {});
 		expect(r.ok).toBe(false);
 		expect(r.error).toMatch(/未找到程序位置/);
 	});
@@ -127,20 +133,20 @@ describe('Trae UI 自动化：等待与未登录检测', () => {
 			seq.push('trigger');
 			return seq.filter((s) => s === 'trigger').length >= 3 ? '{"x":1,"y":2}' : null;
 		});
-		const res = await waitForWorkbench(cdp, 0, 'TraeCode', () => {}, { pollMs: 1, loginGraceMs: 400, deadlineMs: 5000 });
+		const res = await waitForWorkbench(cdp, 0, 'TRAE CN', () => {}, { pollMs: 1, loginGraceMs: 400, deadlineMs: 5000 });
 		expect(res.error).toBeUndefined();
 		expect(res.cdp).toBe(cdp);
 	});
 
 	it('waitForWorkbench：登录按钮持续存在超过宽限期 → 判未登录并给出可读错误', async () => {
 		const { cdp } = scriptedCdp((expr) => (expr.includes('登录') ? '1' : null));
-		const res = await waitForWorkbench(cdp, 0, 'TraeCode', () => {}, { pollMs: 2, loginGraceMs: 60, deadlineMs: 5000 });
-		expect(res.error).toMatch(/TraeCode 未登录/);
+		const res = await waitForWorkbench(cdp, 0, 'TRAE CN', () => {}, { pollMs: 2, loginGraceMs: 60, deadlineMs: 5000 });
+		expect(res.error).toMatch(/TRAE CN 未登录/);
 	});
 
 	it('waitForWorkbench：选择器与登录按钮都不出现 → 超时错误（不是未登录）', async () => {
 		const { cdp } = scriptedCdp(() => null);
-		const res = await waitForWorkbench(cdp, 0, 'TraeCode', () => {}, { pollMs: 2, deadlineMs: 80 });
+		const res = await waitForWorkbench(cdp, 0, 'TRAE CN', () => {}, { pollMs: 2, deadlineMs: 80 });
 		expect(res.error).toMatch(/主界面/);
 		expect(res.error).not.toMatch(/未登录/);
 	});
@@ -148,7 +154,7 @@ describe('Trae UI 自动化：等待与未登录检测', () => {
 	it('waitForWorkbench：调试 socket 已断开时不做求值（避免每次空烧 20 秒超时），无新目标则等到截止', async () => {
 		const { cdp, calls } = scriptedCdp(() => '1', { url: 'ws://test/splash', readyState: 3 });
 		/* 端口 1 上没有调试端点：listPages 立刻连接失败，不会挂住 */
-		const res = await waitForWorkbench(cdp, 1, 'TraeCode', () => {}, { pollMs: 2, deadlineMs: 80 });
+		const res = await waitForWorkbench(cdp, 1, 'TRAE CN', () => {}, { pollMs: 2, deadlineMs: 80 });
 		expect(res.error).toMatch(/主界面/);
 		expect(calls.length).toBe(0);
 	});
