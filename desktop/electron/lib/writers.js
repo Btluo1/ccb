@@ -1816,7 +1816,8 @@ async function rollbackZCode(log, client, detected) {
  *           就是用这个字段传密钥，本版本 core 必然支持）。
  *      这里取 b：密钥跟着配置文件走，回滚 = 还原 .bak，没有全局副作用。
  *   4) 绝不写 ~/.codex/auth.json：那是 ChatGPT 账号登录凭据，覆盖会破坏用户登录态。
- * 默认模型：config.toml 只有一个 model 字段（没有多模型列表的概念），写 cfg.defaultModel。
+ * 默认模型：config.toml 的 model 字段写 cfg.defaultModel；模型选择器的可选项来自
+ * model_catalog_json 指向的模型目录（见下方 2026-10-08 补充 4 与常量区取证）。
  *
  * 2026-10-08 补充（应用自动升级到 v26.1002.7124.0；core 同代 CLI 0.161.0 实测）：
  *   1) wire_api 只能写 "responses"：chat/completions 已被 OpenAI 移除，含 chat 的配置在
@@ -1832,6 +1833,9 @@ async function rollbackZCode(log, client, detected) {
  *   3) CCB 网关 /v1/responses 端点已上线：2026-10-08 实测 /v1/models 返回 200、
  *      /v1/responses 携带 Key 的请求已进入上游路由（当时上游池 503 属运营问题），
  *      Codex 走 responses 的链路成立。
+ *   4) 自定义模型要出现在客户端模型选择器里，必须写 model_catalog_json + 模型目录文件；
+ *      只写 model 字段时选择器只显示内置模型——这是「一键配置后客户端里没有我们的
+ *      自定义模型」的根因（取证与 schema 要求见常量区注释）。
  */
 const CODEX_PROVIDER_ID = 'ccb';
 const CODEX_PROVIDER_NAME = 'CCB';
@@ -1841,6 +1845,24 @@ const CODEX_CHAT_WIRE_API_RE = /^(\s*wire_api\s*=\s*)(["'])chat\2(\s*(?:#.*)?)$/
 /* 写入参数持久化（回滚时用来精准摘掉我们写的 model 行） */
 const CODEX_APPLY_FILE = () => path.join(HOME, '.ccb', 'codex-apply.json');
 
+/* 模型目录（model_catalog_json 指向的文件）——Codex 模型选择器的数据源。
+ * 2026-10-08 取证（CLI 0.161.0 / 桌面版同代 core 实测）：
+ *   1) 不设 model_catalog_json 时，选择器只显示编译进二进制的内置模型（gpt-6-astra 等
+ *      11 个），自定义模型无从出现——这正是「一键配置后客户端里没有我们的模型」的根因。
+ *   2) 一旦设置该键，内置目录被**整体替换**（debug models 只剩我们写的条目），因此必须
+ *      把 CCB 模型全量写进去，不能依赖内置目录兜底。
+ *   3) 条目有强 schema：缺 support_verbosity / truncation_policy /
+ *      experimental_supported_tools，或缺 base_instructions（或 model_messages.
+ *      instructions_template）任一项，Codex 拒绝加载整份配置（应用弹「Codex
+ *      configuration could not be loaded」）。字段集与官方 Codex 系统提示词内置在
+ *      codex-model-template.json（取自 Codex 自身模型条目；同一份提示词 DeepSeek 官方
+ *      配置脚本也在用），逐模型克隆后只改标识字段。 */
+const CODEX_CATALOG_NAME = 'models.json';
+/* 目录条目的上下文窗口：账号服务只下发模型 id，没有窗口大小；取 256K 这一常见网关档位。
+ * 写小了只会让 Codex 提前压缩上下文（安全），写大了可能把超出上游上限的请求发出去。 */
+const CODEX_CATALOG_CONTEXT_WINDOW = 262144;
+const CODEX_MODEL_TEMPLATE = require('./codex-model-template.json');
+
 function codexRoot(client) {
 	return path.join(HOME, (client && client.homeDir) || '.codex');
 }
@@ -1849,24 +1871,143 @@ function codexApplyPath(client) {
 	return (client && typeof client.codexApplyFile === 'string' && client.codexApplyFile) || CODEX_APPLY_FILE();
 }
 
-function codexBlock(cfg) {
+/** 模型目录文件路径 */
+function codexCatalogPath(client) {
+	return path.join(codexRoot(client), CODEX_CATALOG_NAME);
+}
+
+/** 我们的顶层键。TOML 顶层键必须写在任何表头之前，否则会被并入上一个表 */
+function codexTopLevelLines(cfg, catalogPath) {
 	const model = cfg.defaultModel || (cfg.models && cfg.models[0]) || '';
+	const lines = [`model_provider = "${CODEX_PROVIDER_ID}"`, `model = "${model}"`];
+	if (catalogPath) {
+		/* Windows 路径必须写正斜杠：反斜杠在 TOML 字符串里是转义字符 */
+		lines.push(`model_catalog_json = "${String(catalogPath).replace(/\\/g, '/')}"`);
+	}
+	return lines;
+}
+
+/** 由模板克隆出单个模型条目，只改标识字段 */
+function codexCatalogEntry(id, priority) {
+	const e = JSON.parse(JSON.stringify(CODEX_MODEL_TEMPLATE));
+	e.slug = id;
+	e.display_name = id;
+	e.description = `CCB 中转模型 ${id}`;
+	e.priority = priority;
+	e.context_window = CODEX_CATALOG_CONTEXT_WINDOW;
+	e.max_context_window = CODEX_CATALOG_CONTEXT_WINDOW;
+	return e;
+}
+
+/** 我们的模型 id 列表（cfg.models + defaultModel，去重保序） */
+function codexModelIds(cfg) {
+	const ids = (Array.isArray(cfg.models) ? cfg.models : []).map(String).filter(Boolean);
+	if (cfg.defaultModel && !ids.includes(String(cfg.defaultModel))) ids.unshift(String(cfg.defaultModel));
+	return ids;
+}
+
+/** 解析目录文件内容为条目数组（空文件 / 解析失败按空数组处理） */
+function codexCatalogParse(text) {
+	try {
+		const data = JSON.parse(String(text || ''));
+		return Array.isArray(data) ? data : data && Array.isArray(data.models) ? data.models : [];
+	} catch {
+		return [];
+	}
+}
+
+/** 目录里不属于我们（slug 不在 ids 中）的条目 */
+function codexCatalogForeign(text, ids) {
+	return codexCatalogParse(text).filter((m) => m && typeof m.slug === 'string' && !ids.includes(m.slug));
+}
+
+/** 生成模型目录内容：保留已有目录里**不属于我们**的条目（按 slug 区分），再补上我们的模型。
+ *  这样与 DeepSeek 官方脚本等同样写 ~/.codex/models.json 的工具可以共存、互不覆盖。 */
+function codexCatalogJson(cfg, existingText) {
+	const ids = codexModelIds(cfg);
+	const keep = codexCatalogForeign(existingText, ids);
+	const models = [...keep, ...ids.map((id, i) => codexCatalogEntry(id, keep.length + i + 1))];
+	return JSON.stringify({ models }, null, 2) + '\n';
+}
+
+/** 从目录内容里摘掉我们的条目、保留其余（回滚用）。解析失败返回 null。 */
+function codexCatalogWithout(text, ids) {
+	try {
+		JSON.parse(String(text || ''));
+	} catch {
+		return null;
+	}
+	return JSON.stringify({ models: codexCatalogForeign(text, ids) }, null, 2) + '\n';
+}
+
+/** 回滚用：目录里是否只剩我们写入的模型（是则可整个删除） */
+function codexCatalogIsOursOnly(text, ids) {
+	const arr = codexCatalogParse(text);
+	if (!arr.length) return true;
+	return arr.every((m) => m && ids.includes(m.slug));
+}
+
+/** 我们的供应商表（表头 + 键） */
+function codexProviderLines(cfg) {
 	const base = String(cfg.apiBase || '').replace(/\/+$/, '');
 	return [
-		`model_provider = "${CODEX_PROVIDER_ID}"`,
-		`model = "${model}"`,
-		'',
 		`[model_providers.${CODEX_PROVIDER_ID}]`,
 		`name = "${CODEX_PROVIDER_NAME}"`,
 		`base_url = "${base}"`,
 		'wire_api = "responses"', /* 新版 Codex 已移除 chat：只认 responses，见上方 2026-10-08 取证 */
 		`experimental_bearer_token = "${cfg.apiKey}"`,
-	].join('\n');
+	];
 }
 
-/** 摘掉 [model_providers.ccb] 段（到下一个表头或文件尾） */
+/** 去掉首尾空行 */
+function trimBlankEdges(lines) {
+	let a = 0;
+	let b = lines.length;
+	while (a < b && !lines[a].trim()) a++;
+	while (b > a && !lines[b - 1].trim()) b--;
+	return lines.slice(a, b);
+}
+
+/* 我们 provider 表里只会有这几个键 */
+const CODEX_OWN_PROVIDER_KEYS = new Set([
+	'name',
+	'base_url',
+	'wire_api',
+	'experimental_bearer_token',
+]);
+
+/* 顶层赋值行（`key = value`）的键名 */
+const CODEX_TOPLEVEL_KEY_RE = /^\s*([A-Za-z0-9_-]+)\s*=/;
+
+/**
+ * 合并多组顶层行，按键名去重（保留首次出现的那行）。
+ * 旧版写入器可能把同一个用户键既留在顶层、又被 TOML 语义吞进 provider 表：
+ * 救回时若不去重就会写出重复键，TOML duplicate key 会让整份配置加载失败
+ * （比「ignored」更严重——2026-10-08 实机 doctor 取证）。
+ */
+function dedupeTopLevelKeys(groups) {
+	const seen = new Set();
+	const out = [];
+	for (const line of groups) {
+		const m = CODEX_TOPLEVEL_KEY_RE.exec(line);
+		if (m) {
+			if (seen.has(m[1])) continue;
+			seen.add(m[1]);
+		}
+		out.push(line);
+	}
+	return out;
+}
+
+/**
+ * 摘掉 [model_providers.ccb] 段（到下一个表头或文件尾）。
+ * 返回 { lines, rescued }：表内出现的**非我们**的键，是旧版把用户顶层键排在 provider
+ * 表之后、被 TOML 语义并入该表的残留（Codex 会报 unrecognized 并忽略它们）。重建该表
+ * 时若不救回，它们会随表一起消失——所以调用方要把 rescued 放回顶层。
+ */
 function dropCodexProviderTable(lines) {
 	const out = [];
+	const rescued = [];
 	let dropping = false;
 	for (const line of lines) {
 		if (CODEX_PROVIDER_HEADER.test(line)) {
@@ -1874,12 +2015,17 @@ function dropCodexProviderTable(lines) {
 			continue;
 		}
 		if (dropping) {
-			if (/^\s*\[/.test(line)) dropping = false; /* 下面是别的表，落回正常 */
-			else continue;
+			if (/^\s*\[/.test(line)) {
+				dropping = false; /* 下面是别的表，落回正常 */
+			} else {
+				const m = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(line);
+				if (m && !CODEX_OWN_PROVIDER_KEYS.has(m[1])) rescued.push(line);
+				continue;
+			}
 		}
 		out.push(line);
 	}
-	return out;
+	return { lines: out, rescued };
 }
 
 /** 摘掉顶层（第一个表头之前）满足 hit 的赋值行——TOML 的顶层键必须写在任何表头之前 */
@@ -1898,35 +2044,79 @@ function dropTopLevelLines(lines, hit) {
  * 行级合并 config.toml：保留用户其它键与其它 provider，只替换我们这套；
  * 顺带把其它 provider 表里遗留的 wire_api = "chat" 迁移为 "responses"
  * （新版 Codex 校验全部 provider，任一处 chat 都会让配置整体加载失败，详见上方取证）。
+ *
+ * 关键：TOML 里表头之后的所有键都属于该表，再也回不到顶层。因此用户的其它顶层键
+ * （model_reasoning_effort / notify / approval_policy 等）必须留在我们的 provider
+ * 表之前——否则会被吞进 [model_providers.ccb]，Codex 报「ignoring N unrecognized
+ * configuration settings」、用户设置静默失效（2026-10-08 实机 doctor 取证）。
+ * 所以布局固定为：我们的顶层键 → 用户顶层键 → 我们的 provider 表 → 用户的表。
  * 纯函数（不碰文件系统），便于测试。
  */
-function mergeCodexToml(text, cfg) {
+function mergeCodexToml(text, cfg, catalogPath) {
 	const raw = String(text == null ? '' : text);
 	const eol = /\r\n/.test(raw) ? '\r\n' : '\n';
 	let lines = raw.replace(/\r\n/g, '\n').split('\n');
-	lines = dropCodexProviderTable(lines);
-	lines = dropTopLevelLines(lines, (l) => /^\s*(model_provider|model)\s*=/.test(l));
-	lines = lines.map((line) => {
-		const m = CODEX_CHAT_WIRE_API_RE.exec(line);
-		return m ? `${m[1]}"responses"${m[3]}` : line;
-	});
-	while (lines.length && !lines[0].trim()) lines.shift();
-	const body = lines.join('\n').replace(/\n+$/, '');
-	const out = codexBlock(cfg) + '\n' + (body ? '\n' + body + '\n' : '');
-	return out.replace(/\n/g, eol);
+
+	/* 1) 摘掉我们自己的 provider 表（可能在任意位置），并救回旧版误吞进该表的用户顶层键 */
+	const dropped = dropCodexProviderTable(lines);
+	lines = dropped.lines;
+	const rescued = trimBlankEdges(dropped.rescued);
+
+	/* 2) 以第一个表头为界切成「顶层区 / 表区」 */
+	const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+	const head = firstTable === -1 ? lines : lines.slice(0, firstTable);
+	const rest = firstTable === -1 ? [] : lines.slice(firstTable);
+
+	/* 3) 顶层区只摘掉用户自己的 model_provider / model / model_catalog_json（换成我们的）。
+	 *    model_catalog_json 必须一起摘：重复键会让整份配置加载失败。 */
+	const headOut = trimBlankEdges(
+		head.filter((l) => !/^\s*(model_provider|model|model_catalog_json)\s*=/.test(l))
+	);
+
+	/* 4) 用户表区：迁移遗留 chat → responses（只动这一行，其余原样） */
+	const restOut = trimBlankEdges(
+		rest.map((line) => {
+			const m = CODEX_CHAT_WIRE_API_RE.exec(line);
+			return m ? `${m[1]}"responses"${m[3]}` : line;
+		})
+	);
+
+	/* 用户顶层键 + 救回的键合并去重：同一键在顶层与 provider 表里各存一份时，
+	 * 只留顶层那份，避免写出重复键让配置整体加载失败 */
+	const userTop = trimBlankEdges(dedupeTopLevelKeys([...headOut, ...rescued]));
+
+	const parts = [codexTopLevelLines(cfg, catalogPath).join('\n')];
+	if (userTop.length) parts.push(userTop.join('\n'));
+	parts.push(codexProviderLines(cfg).join('\n'));
+	if (restOut.length) parts.push(restOut.join('\n'));
+	return (parts.join('\n\n').replace(/\n+$/, '') + '\n').replace(/\n/g, eol);
 }
 
 /** 摘掉我们写入的内容（无备份时的兜底回滚）。model 从持久化的写入参数里取。纯函数。 */
-function stripCodexToml(text, model) {
+function stripCodexToml(text, model, catalogPath) {
 	const raw = String(text == null ? '' : text);
 	const eol = /\r\n/.test(raw) ? '\r\n' : '\n';
 	const esc = String(model || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 	const pats = [/^\s*model_provider\s*=\s*"ccb"\s*$/i];
 	if (model) pats.push(new RegExp(`^\\s*model\\s*=\\s*"${esc}"\\s*$`));
-	let lines = dropCodexProviderTable(raw.replace(/\r\n/g, '\n').split('\n'));
-	lines = dropTopLevelLines(lines, (l) => pats.some((re) => re.test(l)));
-	while (lines.length && !lines[0].trim()) lines.shift();
-	while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+	/* 只摘掉指向我们目录的那一行：用户自己的 model_catalog_json 不动 */
+	if (catalogPath) {
+		const cEsc = String(catalogPath).replace(/\\/g, '/').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+		pats.push(new RegExp(`^\\s*model_catalog_json\\s*=\\s*"${cEsc}"\\s*$`));
+	}
+	const dropped = dropCodexProviderTable(raw.replace(/\r\n/g, '\n').split('\n'));
+	let lines = dropTopLevelLines(dropped.lines, (l) => pats.some((re) => re.test(l)));
+
+	/* 旧版误吞进 provider 表的用户顶层键：放回顶层，别随表一起删掉。
+	 * 与顶层已有键去重，避免回滚反而写出重复键。 */
+	const rescued = trimBlankEdges(dropped.rescued);
+	if (rescued.length) {
+		const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+		const at = firstTable === -1 ? lines.length : firstTable;
+		lines = dedupeTopLevelKeys(lines.slice(0, at).concat(rescued)).concat(lines.slice(at));
+	}
+
+	lines = trimBlankEdges(lines);
 	if (!lines.length) return '';
 	return lines.join('\n') + eol;
 }
@@ -1938,9 +2128,27 @@ async function writeCodex(cfg, log, client) {
 		return { ok: false, error: `未找到 ${root}，请先安装并启动一次 ${label} 再重试` };
 	}
 	const file = path.join(root, 'config.toml');
+	const catalog = codexCatalogPath(client);
+	const catalogIds = codexModelIds(cfg);
 	backupOnce(file, log);
 	const before = fs.existsSync(file) ? readText(file) : '';
-	writeText(file, mergeCodexToml(before, cfg));
+	/* 模型目录：Codex 模型选择器读 model_catalog_json 指向的这份文件。
+	 * 不写它，客户端里就不会出现我们的自定义模型（见上方 2026-10-08 取证）。
+	 * 注意：空目录 {"models":[]} 会被 Codex 直接拒绝（「failed to parse
+	 * model_catalog_json」→ 应用弹「Codex configuration could not be loaded」），
+	 * 所以拿不到模型列表时宁可不写这个键，退回显示内置模型。 */
+	const writeCatalog = catalogIds.length > 0;
+	writeText(file, mergeCodexToml(before, cfg, writeCatalog ? catalog : null));
+
+	if (writeCatalog) {
+		backupOnce(catalog, log);
+		const catalogBefore = fs.existsSync(catalog) ? readText(catalog) : '';
+		writeText(catalog, codexCatalogJson(cfg, catalogBefore));
+		log(`已写入 ${catalog}（${catalogIds.length} 个模型进入 Codex 模型选择器：${catalogIds.join('、')}）`);
+	} else {
+		log('提示：未获取到模型列表，已跳过 Codex 模型目录（客户端将只显示内置模型）');
+	}
+
 	const legacyChat = before.split(/\r?\n/).filter((l) => CODEX_CHAT_WIRE_API_RE.test(l)).length;
 	if (legacyChat) {
 		log(`已将 ${legacyChat} 处遗留的 wire_api = "chat" 迁移为 "responses"（新版 Codex 不再支持 chat，任一处都会导致客户端无法启动）`);
@@ -1948,22 +2156,23 @@ async function writeCodex(cfg, log, client) {
 	const model = cfg.defaultModel || (cfg.models && cfg.models[0]) || '';
 	log(`已写入 ${file}（供应商 ${CODEX_PROVIDER_ID} → ${String(cfg.apiBase || '').replace(/\/+$/, '')}，默认模型 ${model}）`);
 
-	/* 记下写入参数：回滚且没有 .bak 时按它精准摘掉 model 行 */
+	/* 记下写入参数：回滚且没有 .bak 时按它精准摘掉 model 行、判断目录可否整个删除 */
 	try {
 		const applyFile = codexApplyPath(client);
 		fs.mkdirSync(path.dirname(applyFile), { recursive: true });
-		fs.writeFileSync(applyFile, JSON.stringify({ model, savedAt: Date.now() }));
+		fs.writeFileSync(applyFile, JSON.stringify({ model, models: catalogIds, savedAt: Date.now() }));
 	} catch (e) {
 		log(`提示：参数记录写入失败（不影响本次配置）：${e.message}`);
 	}
 
-	log(`完成。启动 ${label} 后请求即走 CCB 中转，无需再手动改任何设置。`);
+	log(`完成。启动 ${label} 后请求即走 CCB 中转${writeCatalog ? '，模型选择器里可选 CCB 模型' : ''}，无需再手动改任何设置。`);
 	return { ok: true };
 }
 
 async function rollbackCodex(log, client) {
 	const root = codexRoot(client);
 	const file = path.join(root, 'config.toml');
+	const catalog = codexCatalogPath(client);
 	const applyFile = codexApplyPath(client);
 	let saved = null;
 	try {
@@ -1971,6 +2180,7 @@ async function rollbackCodex(log, client) {
 	} catch {
 		/* 没有写入参数（或已删除）：无备份时无法确定要摘哪一行 model，按无 model 处理 */
 	}
+	const savedIds = Array.isArray(saved && saved.models) ? saved.models.map(String) : [];
 
 	let changed = 0;
 	if (fs.existsSync(file)) {
@@ -1978,7 +2188,7 @@ async function rollbackCodex(log, client) {
 			changed++;
 		} else {
 			const before = readText(file);
-			const after = stripCodexToml(before, saved && saved.model);
+			const after = stripCodexToml(before, saved && saved.model, catalog);
 			if (after !== before) {
 				if (!after.trim()) {
 					fs.rmSync(file);
@@ -1988,6 +2198,27 @@ async function rollbackCodex(log, client) {
 					log(`已从 ${file} 移除 CCB 供应商与默认模型`);
 				}
 				changed++;
+			}
+		}
+	}
+
+	/* 模型目录：优先还原备份；无备份时只在「只剩我们的模型」时删除，否则摘掉我们的条目 */
+	if (fs.existsSync(catalog)) {
+		if (restoreBackup(catalog, log)) {
+			changed++;
+		} else {
+			const before = readText(catalog);
+			if (codexCatalogIsOursOnly(before, savedIds)) {
+				fs.rmSync(catalog);
+				log(`已删除 ${catalog}（CCB 写入的模型目录）`);
+				changed++;
+			} else {
+				const after = codexCatalogWithout(before, savedIds);
+				if (after != null && after !== before) {
+					writeText(catalog, after);
+					log(`已从 ${catalog} 移除 CCB 模型条目`);
+					changed++;
+				}
 			}
 		}
 	}
@@ -2265,4 +2496,7 @@ module.exports = {
 	accountUidsUnder,
 	mergeCodexToml,
 	stripCodexToml,
+	codexCatalogJson,
+	codexCatalogWithout,
+	codexCatalogIsOursOnly,
 };

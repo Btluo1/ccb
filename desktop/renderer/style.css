@@ -540,7 +540,8 @@ input::placeholder { color: var(--dim); }
 }
 .modal-card {
 	position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 401;
-	width: min(520px, calc(100vw - 48px));
+	width: min(560px, calc(100vw - 48px));
+	max-height: min(86vh, 680px); overflow: auto;
 	background: #ffffff; border: 1px solid var(--line); border-radius: 14px;
 	padding: 20px 22px 16px; box-shadow: 0 18px 60px rgba(24, 33, 58, 0.30);
 }
@@ -553,11 +554,18 @@ input::placeholder { color: var(--dim); }
 .modal-close:hover { color: var(--text); background: var(--bg-soft); }
 .modal-sub { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; }
 .shop-item {
+	display: flex; align-items: center; gap: 16px;
 	border: 1px solid var(--line-soft); border-radius: 10px;
 	background: var(--card-2); padding: 12px 14px; margin-bottom: 10px;
 }
 .shop-item:last-child { margin-bottom: 0; }
-.shop-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.shop-qr {
+	flex: 0 0 auto; width: 150px; height: 150px;
+	object-fit: contain; background: #ffffff;
+	border: 1px solid var(--line-soft); border-radius: 10px;
+}
+.shop-info { flex: 1 1 auto; min-width: 0; }
+.shop-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
 .shop-name { font-weight: 700; font-size: 13px; }
 .shop-url {
 	font: 11.5px var(--mono); color: var(--muted);

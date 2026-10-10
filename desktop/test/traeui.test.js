@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 
 /* 与 writers.js 用同一份模块实例，避免出现两份 SEL / 两份逻辑 */
 const require = createRequire(import.meta.url);
-const { displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForAny, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE } = require('../electron/lib/traeui');
+const { displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE } = require('../electron/lib/traeui');
 
 describe('Trae UI 自动化：纯逻辑', () => {
 	it('展示名统一加 CCB 前缀（Trae 列表里混着同名预置模型）', () => {
@@ -84,10 +84,13 @@ describe('Trae UI 自动化：写入器接线', () => {
 });
 
 describe('Trae UI 自动化：等待与未登录检测', () => {
-	/** 脚手架：让 cdp.evaluate(expr) 依次按预设返回；页面导航失败用「抛错」模拟 */
-	function scriptedCdp(responses) {
+	/** 脚手架：让 cdp.evaluate(expr) 依次按预设返回；页面导航失败用「抛错」模拟。
+	 * waitForWorkbench 会按序求值 RECT_TRIGGER（找模型选择器）与 LOGIN_VISIBLE（找登录按钮），
+	 * 预设函数用「是否含“登录”」区分这两类探测。 */
+	function scriptedCdp(responses, ws) {
 		const calls = [];
 		const cdp = {
+			ws: ws || { url: 'ws://test/target-1', readyState: 1 },
 			evaluate: async (expr) => {
 				calls.push(expr);
 				const hit = responses(expr, calls.length);
@@ -113,9 +116,41 @@ describe('Trae UI 自动化：等待与未登录检测', () => {
 		await expect(waitFor(cdp, 'TRIGGER', 300, '主界面')).rejects.toThrow(/等待「主界面」超时/);
 	});
 
-	it('waitForAny：返回先为真的那个表达式（登录按钮先出现 → 按 TRIGGER 顺序不误判）', async () => {
-		const { cdp } = scriptedCdp((expr) => (expr === 'LOGIN' ? '1' : null));
-		await expect(waitForAny(cdp, ['TRIGGER', 'LOGIN'], 2000, '主界面')).resolves.toBe('LOGIN');
+	it('waitForWorkbench：登录按钮冷启动瞬时出现后消失、选择器随后就位 → 不误判未登录（本 bug 曾让已登录用户必现失败）', async () => {
+		const seq = [];
+		const { cdp } = scriptedCdp((expr) => {
+			/* 顺序：触发器(无) → 登录按钮(有，冷启动顶栏先渲染登录态) → 触发器(无) → 登录按钮(无，会话已恢复) → 触发器(有) */
+			if (expr.includes('登录')) {
+				seq.push('login');
+				return seq.filter((s) => s === 'login').length === 1 ? '1' : '';
+			}
+			seq.push('trigger');
+			return seq.filter((s) => s === 'trigger').length >= 3 ? '{"x":1,"y":2}' : null;
+		});
+		const res = await waitForWorkbench(cdp, 0, 'TraeCode', () => {}, { pollMs: 1, loginGraceMs: 400, deadlineMs: 5000 });
+		expect(res.error).toBeUndefined();
+		expect(res.cdp).toBe(cdp);
+	});
+
+	it('waitForWorkbench：登录按钮持续存在超过宽限期 → 判未登录并给出可读错误', async () => {
+		const { cdp } = scriptedCdp((expr) => (expr.includes('登录') ? '1' : null));
+		const res = await waitForWorkbench(cdp, 0, 'TraeCode', () => {}, { pollMs: 2, loginGraceMs: 60, deadlineMs: 5000 });
+		expect(res.error).toMatch(/TraeCode 未登录/);
+	});
+
+	it('waitForWorkbench：选择器与登录按钮都不出现 → 超时错误（不是未登录）', async () => {
+		const { cdp } = scriptedCdp(() => null);
+		const res = await waitForWorkbench(cdp, 0, 'TraeCode', () => {}, { pollMs: 2, deadlineMs: 80 });
+		expect(res.error).toMatch(/主界面/);
+		expect(res.error).not.toMatch(/未登录/);
+	});
+
+	it('waitForWorkbench：调试 socket 已断开时不做求值（避免每次空烧 20 秒超时），无新目标则等到截止', async () => {
+		const { cdp, calls } = scriptedCdp(() => '1', { url: 'ws://test/splash', readyState: 3 });
+		/* 端口 1 上没有调试端点：listPages 立刻连接失败，不会挂住 */
+		const res = await waitForWorkbench(cdp, 1, 'TraeCode', () => {}, { pollMs: 2, deadlineMs: 80 });
+		expect(res.error).toMatch(/主界面/);
+		expect(calls.length).toBe(0);
 	});
 
 	it('waitForRect：坐标表达式先返回 null 后返回 JSON，要等它出现（连通性测试期间提交按钮禁用）', async () => {
@@ -136,11 +171,6 @@ describe('Trae UI 自动化：等待与未登录检测', () => {
 			return null;
 		});
 		await expect(waitForRect(cdp, 'RECT', 300, '提交按钮')).rejects.toThrow(/提交按钮不可用/);
-	});
-
-	it('waitForAny：TRIGGER 先出现则返回 TRIGGER', async () => {
-		const { cdp } = scriptedCdp((expr) => (expr === 'TRIGGER' ? '{x:1}' : null));
-		await expect(waitForAny(cdp, ['TRIGGER', 'LOGIN'], 2000, '主界面')).resolves.toBe('TRIGGER');
 	});
 
 	it('未登录脚本只认可见按钮的精确「登录」文案，且是合法 JS', () => {

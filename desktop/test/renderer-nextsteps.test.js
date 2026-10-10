@@ -127,6 +127,21 @@ describe('一键配置完成后的后续步骤提示', () => {
 		dom.window.close();
 	});
 
+	it('Trae 系非未登录失败（如主界面超时）：显示真实原因与重试指引，不再误导已登录的用户去登录', async () => {
+		const dom = await mount('trae-cn', {
+			ok: false,
+			log: ['正在以调试模式启动 TraeCode…', '看到「登录」按钮，先等 TraeCode 恢复登录会话…'],
+			error: 'TraeCode 主界面等待超时：模型选择器一直没出现，请确认客户端窗口已打开后重试',
+		});
+		const summary = await applyAll(dom);
+		const box = await waitFor(() => summary.querySelector('.as-steps.fail'));
+		const text = textOf(box);
+		expect(text).toContain('配置未完成');
+		expect(text).toContain('主界面等待超时');
+		expect(text).not.toContain('先在客户端登录');
+		dom.window.close();
+	});
+
 	it('Trae 系已登录写入成功：明确说明不用再手动切模型', async () => {
 		const dom = await mount('trae-cn', { ok: true, log: ['已写入全部模型与默认模型'] });
 		const summary = await applyAll(dom);

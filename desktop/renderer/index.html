@@ -186,27 +186,33 @@
 </div>
 <div id="toast"></div>
 
-<!-- 代理商购买余额兑换卡弹窗：列出淘宝店铺链接，复制后到淘宝 App 打开购买 -->
+<!-- 代理商购买余额兑换卡弹窗：每个店铺同时给出商品二维码和淘宝链接，扫码或复制链接后到淘宝 App 打开购买 -->
 <div class="modal-dim" id="buyCardDim" hidden></div>
 <div class="modal-card" id="buyCardModal" role="dialog" aria-labelledby="buyCardTitle" hidden>
   <div class="modal-head">
     <h2 id="buyCardTitle">淘宝购买兑换卡</h2>
     <button class="modal-close" id="buyCardClose" type="button" aria-label="关闭">×</button>
   </div>
-  <p class="modal-sub">复制链接后在淘宝 App 中打开</p>
+  <p class="modal-sub">用淘宝 App 扫码，或复制链接后在淘宝 App 中打开</p>
   <div class="shop-item">
-    <div class="shop-top">
-      <span class="shop-name">店1</span>
-      <button class="btn sm ghost btn-copy" data-copy="https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1088221114898" type="button">复制</button>
+    <img class="shop-qr" src="qr/shop1.png" alt="店1 商品二维码" loading="lazy" />
+    <div class="shop-info">
+      <div class="shop-top">
+        <span class="shop-name">店1</span>
+        <button class="btn sm ghost btn-copy" data-copy="https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1088221114898" type="button">复制链接</button>
+      </div>
+      <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1088221114898</div>
     </div>
-    <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1088221114898</div>
   </div>
   <div class="shop-item">
-    <div class="shop-top">
-      <span class="shop-name">店2</span>
-      <button class="btn sm ghost btn-copy" data-copy="https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1090346436214" type="button">复制</button>
+    <img class="shop-qr" src="qr/shop2.png" alt="店2 商品二维码" loading="lazy" />
+    <div class="shop-info">
+      <div class="shop-top">
+        <span class="shop-name">店2</span>
+        <button class="btn sm ghost btn-copy" data-copy="https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1090346436214" type="button">复制链接</button>
+      </div>
+      <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1090346436214</div>
     </div>
-    <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1090346436214</div>
   </div>
 </div>
 
