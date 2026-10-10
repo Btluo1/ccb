@@ -353,7 +353,7 @@ async function writeCodeBuddy(cfg, log, client) {
 }
 
 /* ---------- Trae 系（UI 自动化写入） ----------
- * Trae / TraeCode / TraeWork 四端共用 @byted-icube/ai-modules-chat，模型列表键为
+ * Trae / TRAE CN / TraeWork 国际版三端共用 @byted-icube/ai-modules-chat，模型列表键为
  * `AI.agent.model.model_list_map`。逐条取证（详见 clients.js 的 TRAE 说明）：
  *   - 该键由 storeModelListMap() 写入，客户端只把 getModelListMapFromCache() 当缓存读；
  *   - 真实来源是服务端 RPC（ModelService → model-list-service），启动即整表重取覆盖本地；

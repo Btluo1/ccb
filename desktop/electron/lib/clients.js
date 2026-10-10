@@ -22,7 +22,7 @@ const APP_PATH_ROOTS = [
 ];
 
 /**
- * 支持的客户端清单（15 项，全部为**桌面客户端**）
+ * 支持的客户端清单（14 项，全部为**桌面客户端**）
  *
  * 产品定位：一键配置面向桌面客户端，不含 CLI 工具（Codex CLI 不配置——它属于终端工具，
  * 但同名产品的 Codex 桌面版（MSIX 包 OpenAI.Codex，开始菜单显示为 ChatGPT）在清单内；
@@ -43,10 +43,12 @@ const APP_PATH_ROOTS = [
  *                 不能走「先 taskkill 不带 /F」的优雅关闭（见 launcher.js 的说明）
  *
  * 关键实测结论（勿凭产品名臆测）：
- *   - 「TraeCode CN」就是字节中国版 Trae IDE（安装目录仍是 Programs\Trae CN）
- *   - 「TraeWork CN」就是 TRAE SOLO CN（userData 目录仍是 TRAE SOLO CN），其模型列表
- *     场景与 Trae IDE 完全不同（9 个 solo 场景 vs 7 个 IDE 场景）；四端模型列表均由
- *     服务端同步覆盖，本地文件写入无效，因此走 CDP 驱动官方「添加模型」界面（traeui.js）
+ *   - Trae 官方自 3.4 版起把两个中国版客户端合并为一个「TRAE CN」：原 TraeCode CN
+ *     （Trae CN IDE）与原 TraeWork CN（TRAE SOLO CN 智能体）都由 TRAE CN 承载
+ *     （安装目录仍是 Programs\Trae CN、进程 Trae CN.exe、userData 仍是 %APPDATA%\Trae CN，
+ *     SOLO 能力内置为客户端里的工作模式）；旧 TRAE SOLO CN 独立客户端已停更下线。
+ *   - Trae 系模型列表场景均由服务端同步覆盖，本地文件写入无效，因此走 CDP 驱动
+ *     官方「添加模型」界面（traeui.js），配置存 Trae 账号、重启不丢
  *   - 「Qoder IDE」是 VS Code 分支（~/.qoder、%APPDATA%\Qoder）；Qoder 独立桌面 App
  *     是另一个产品（userData 为 com.qoder.app.stable）
  *   - 「Qoder CN」桌面版与「Qoder CN IDE」共用同一个 qodercli 配置目录 ~/.qoder-cn
@@ -57,6 +59,10 @@ const APP_PATH_ROOTS = [
  *   - Codex CLI（@openai/codex 终端工具）：属于 CLI，不在「桌面客户端」定位内
  *     （它读的是同一份 ~/.codex/config.toml，一键配置写入后终端侧同样可用，
  *     但清单里只登记桌面版，见上方 codex 条目）。
+ *   - TraeWork CN（旧 TRAE SOLO CN 独立客户端）：Trae 官方 3.4 更新后与 TraeCode CN
+ *     合并为单一客户端「TRAE CN」（见 trae-cn 条目），产品已下线，不再是独立清单项；
+ *     老客户端若还装在机器上也只是遗留安装，配置走 TRAE CN 即可（模型存 Trae 账号，
+ *     与客户端形态无关）。
  *   - Kiro：逐 bundle 取证确认没有任何 BYOK 通道——扩展未注册语言模型提供方，
  *     不读 ANTHROPIC_BASE_URL 等环境变量，请求走私有协议 runtime.{region}.kiro.dev，
  *     普通 OpenAI/Anthropic 兼容中转无法对接。
@@ -76,7 +82,7 @@ const APP_PATH_ROOTS = [
  *
  * 图标来源为本机各客户端自带的品牌资源（应用图标/随包 logo），提取脚本见
  * scripts/extract-icons.ps1；同一产品的国际版/中国版共用一张（它们本来就是同一品牌）：
- *   - Trae 与 TraeCode CN 的 exe 图标完全一致 → 共用 trae
+ *   - Trae 国际版与 TRAE CN 的 exe 图标完全一致 → 共用 trae
  *   - WorkBuddy CN 与 WorkBuddy AI 的 icon.png 完全一致 → 共用 workbuddy
  *   - Qoder IDE 国际版本机未安装 → 与 Qoder CN IDE 共用 qoder（同一品牌标记）
  *   - TraeWork / QoderWork 国际版本机未安装 → 与各自 CN 版共用
@@ -86,7 +92,6 @@ const BRAND_ICONS = {
 	'trae-intl': 'trae',
 	'trae-cn': 'trae',
 	'traework-intl': 'traework',
-	'traework-cn': 'traework',
 	'qoder-intl': 'qoder',
 	'qoder-cn': 'qoder',
 	'qoder-app-cn': 'qoder-app',
@@ -101,7 +106,7 @@ const BRAND_ICONS = {
 };
 
 /**
- * Trae 系（Trae / TraeCode / TraeWork，四端共用同一套模型模块 @byted-icube/ai-modules-chat）
+ * Trae 系（Trae / TRAE CN / TraeWork 国际版，三端共用同一套模型模块 @byted-icube/ai-modules-chat）
  * 的写入方式与其它客户端不同：**不能写本地文件，只能驱动客户端自己的「添加模型」界面**。
  * 逐条取证：
  *   1. 该模块内 `K = "AI.agent.model.model_list_map"`，`storeModelListMap()` 把模型列表
@@ -130,7 +135,10 @@ const CLIENTS = [
 		homeDir: '.trae',
 	},
 	{
-		id: 'trae-cn', name: 'TraeCode', variant: '中国版', vendor: '字节跳动', site: 'trae.cn',
+		/* TRAE CN（3.4+）：Trae 官方把 TraeCode CN 与 TraeWork CN（TRAE SOLO CN）合并后的
+		 * 单一中国版客户端，IDE 与 SOLO 两种工作模式内置其中；安装目录 / exe / userData /
+		 * ~/.trae-cn 与合并前的 TraeCode CN 完全一致，老用户的自定义路径无需重选。 */
+		id: 'trae-cn', name: 'TRAE CN', variant: '', vendor: '字节跳动', site: 'trae.cn',
 		glyph: 'T', accent: '#2563eb', mode: 'auto', writer: TRAE_WRITER, provider: 'openai',
 		appDirs: ['Trae CN'],
 		exeNames: ['Trae CN.exe', 'TRAE CN.exe'],
@@ -144,12 +152,6 @@ const CLIENTS = [
 		 * 注册表 App Paths / 开始菜单快捷方式 / 卸载表反查到真实安装路径。 */
 		appDirs: ['TRAE SOLO', 'TRAE SOLO GLOBAL', 'TraeWork', 'TRAE Work'],
 		exeNames: ['TRAE SOLO.exe', 'TRAE SOLO GLOBAL.exe', 'TraeWork.exe', 'TRAE Work.exe'],
-	},
-	{
-		id: 'traework-cn', name: 'TraeWork', variant: '中国版', vendor: '字节跳动', site: 'trae.cn',
-		glyph: 'TW', accent: '#4f46e5', mode: 'auto', writer: TRAE_WRITER, provider: 'openai',
-		appDirs: ['TRAE SOLO CN'],
-		exeNames: ['TRAE SOLO CN.exe'],
 	},
 	{
 		id: 'qoder-intl', name: 'Qoder IDE', variant: '国际版', vendor: '阿里巴巴', site: 'qoder.com',

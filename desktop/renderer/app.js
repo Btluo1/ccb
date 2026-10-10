@@ -535,7 +535,7 @@ async function applyAll() {
  *     个别情况下界面当前模型没设上（写入器会带 warning），按提示手动选一次即可。
  * 一键配置完成后按实际结果给这些客户端醒目提示，省得用户以为「配置成功了却没效果」。
  */
-const TRAE_IDS = new Set(['trae-intl', 'trae-cn', 'traework-intl', 'traework-cn']);
+const TRAE_IDS = new Set(['trae-intl', 'trae-cn', 'traework-intl']);
 
 /** 该客户端是否要求先在客户端里登录才能写入；返回 null 表示打开即用 */
 function clientLoginReq(c) {
@@ -1187,7 +1187,7 @@ const HELP_ITEMS = [
 		q: '配置完成后，客户端里还是原来的模型 / 找不到 CCB 模型',
 		a: `<ol class="qa-steps">
 			<li>打开客户端，在<b>模型选择器</b>里选一次带 <b>CCB</b> 前缀的模型（形如 <code>CCB glm-5.3</code>）。</li>
-			<li>Trae 系（Trae / TraeCode / TraeWork）、WorkBuddy、QoderWork 的模型保存在你的客户端账号里：先在客户端登录，再回到本窗口重新点「一键配置并启动」。</li>
+			<li>Trae 系（TRAE CN / Trae / TraeWork）、WorkBuddy、QoderWork 的模型保存在你的客户端账号里：先在客户端登录，再回到本窗口重新点「一键配置并启动」。</li>
 			<li>注意别选错：客户端自带模型可能与 CCB 模型同名（比如都叫 glm-5.3），只有带 <b>CCB</b> 前缀的才是走中转的。</li>
 		</ol>`,
 	},

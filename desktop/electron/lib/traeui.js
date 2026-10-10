@@ -2,16 +2,16 @@
  * Trae 系「一键添加自定义模型」——通过 CDP 驱动客户端自带的「添加模型」界面
  *
  * 为什么必须这么做（逐条取证见 clients.js / writers.js 的说明）：
- * Trae / TraeCode / TraeWork 的模型列表 `AI.agent.model.model_list_map` 只是**服务端
+ * Trae / TRAE CN / TraeWork 的模型列表 `AI.agent.model.model_list_map` 只是**服务端
  * 模型目录的本地缓存**，客户端启动即整表重取覆盖——本地文件写入必被清掉（实测写入
  * 171 条后启动客户端即归零、内容字节级还原）。自定义模型的权威存储是 Trae 账号
  * （服务端 RPC add_custom_model），本地无任何可写入口。
  *
- * 因此这里复用客户端**自己的**界面与网络层：带 `--remote-debugging-port` 启动 Trae，
+ * 因此这里复用客户端**自己的**界面与网络层：带 `--remote-debugging-port` 启动客户端，
  * 用 CDP 真实点击「模型选择器 → 添加模型 → 自定义模型」表单并提交。客户端会用它自己
  * 的登录态调用 add_custom_model，配置落到账号上，重启也不会丢。
  *
- * 实测（TraeWork CN，2026-09-23）：
+ * 实测（TraeWork CN，2026-09-23；TRAE CN 3.4 合并版沿用同一套界面）：
  *   提交后服务端返回的条目形如
  *     { name: 'custom_openai_compatible//glm-5.3', provider: 'custom_openai_compatible',
  *       display_name: 'CCB glm-5.3', base_url: '<我们的地址>/chat/completions',
