@@ -553,6 +553,30 @@ input::placeholder { color: var(--dim); }
 }
 .modal-close:hover { color: var(--text); background: var(--bg-soft); }
 .modal-sub { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; }
+
+/* ---------- 手动配置教程弹窗 ---------- */
+.manual-card { width: min(660px, calc(100vw - 48px)); }
+.manual-select {
+	width: 100%; margin-bottom: 12px;
+	padding: 7px 10px; font-size: 13px;
+	border: 1px solid var(--line); border-radius: 8px; background: #ffffff;
+}
+.manual-select:focus { outline: 2px solid var(--ring, #bfd3f8); outline-offset: 1px; }
+.manual-card .summary { margin-bottom: 12px; }
+.manual-code {
+	position: relative;
+	background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: 8px;
+	padding: 10px 44px 10px 12px; margin: 8px 0 10px;
+	font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+	white-space: pre; overflow-x: auto;
+}
+.manual-code .btn-copy { position: absolute; top: 6px; right: 6px; }
+.manual-code code { font-family: var(--mono); background: none; padding: 0; border: none; }
+.manual-card .qa-note { margin: 0 0 10px; }
+.manual-card .qa-note.warn {
+	background: #fdf8ef; border: 1px solid #f3d9a4; border-radius: 8px;
+	padding: 8px 10px; color: #92400e;
+}
 .shop-item {
 	display: flex; align-items: center; gap: 16px;
 	border: 1px solid var(--line-soft); border-radius: 10px;

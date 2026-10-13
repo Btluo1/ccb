@@ -313,6 +313,154 @@ function closeBuyCard() {
 	$('#buyCardModal').hidden = true;
 }
 
+/* ================= 手动配置教程弹窗 =================
+ * 一键配置失败/不可用时的自助兜底：选择客户端 → 展示服务地址与密钥（真实值，可复制）
+ * + 该客户端的手动接入步骤。服务地址/密钥行复用 summary 样式，复制按钮复用全局
+ * btn-copy 委托。教程内容按 writer 分组；Qoder 系桌面版因服务端权益校验无法手动
+ * 接入（表现为「系统发生异常」），改为给一键失败的排查步骤，文案须与 qoderbridge.js
+ * 的 Windows 指引保持一致。 */
+
+const manualOpen = () => !$('#manualModal').hidden;
+
+/* 代码片段块：pre + 右上角复制按钮（data-copy 放原始内容，esc 进属性） */
+function codeBlock(text) {
+	return `<pre class="manual-code"><button class="btn sm ghost btn-copy" data-copy="${esc(text)}" type="button">复制</button><code>${esc(text)}</code></pre>`;
+}
+
+/* 各客户端手动教程（v = { base, key, model, hasKey }），返回 HTML */
+const MANUAL_GUIDES = {
+	/* Trae 系（TRAE CN / Trae / TraeWork）：BYOK 自定义模型界面可填 base_url + 密钥 */
+	traeui: (v) => `
+		<div class="qa-note">需要客户端账号已登录，且账号开通了「自定义模型（BYOK）」功能；不同版本界面略有差异，以客户端实际显示为准。一键配置可一次配完全部模型并设默认模型，建议优先使用。</div>
+		<ol class="qa-steps">
+			<li>打开客户端并登录，进入 <b>设置 → 模型设置</b>（或在对话下方模型选择器里点「添加模型」）。</li>
+			<li>选择「自定义模型」，接口类型选 <b>OpenAI 兼容</b>。</li>
+			<li>粘贴上方的服务地址与 API 密钥，模型名填一个 CCB 模型（如 <code>${esc(v.model)}</code>，完整列表见第 1 步「可用模型」）。</li>
+			<li>保存后在对话的模型选择器里选中它即可开始使用。</li>
+		</ol>`,
+	/* Qoder 系桌面版：自定义模型请求经服务端按权益校验，手填必被拒，不能手动接入 */
+	qoderappcn: null,
+	qoderwork: null,
+	/* WorkBuddy / CodeBuddy：客户端自带 BYOK 自定义模型入口 */
+	workbuddy: (v) => `
+		<div class="qa-note">模型名使用平台的映射名（CodeBuddy/WorkBuddy 侧的别名）；若手填后调用报错，建议回到本窗口用「一键配置并启动」自动写入。</div>
+		<ol class="qa-steps">
+			<li>打开客户端并登录，进入 <b>设置 → 自定义模型</b>（BYOK 入口）。</li>
+			<li>添加 OpenAI 兼容模型：粘贴上方的服务地址与 API 密钥，模型名填 <code>${esc(v.model)}</code>。</li>
+			<li>保存后在新建对话 / 任务时选择该模型即可。</li>
+		</ol>`,
+	codebuddy: null, /* 复用 workbuddy 文案，见下方 MANUAL_GUIDES.codebuddy 赋值 */
+	zcode: (v) => {
+		const frag = JSON.stringify({
+			name: 'CCB',
+			kind: 'openai-compatible',
+			source: 'custom',
+			enabled: true,
+			options: { apiKey: v.key, baseURL: v.base, apiKeyRequired: true },
+			models: { [v.model]: {} },
+		}, null, 2);
+		const cli = JSON.stringify({
+			model: `ccb/${v.model}`,
+			provider: { ccb: { options: { baseURL: v.base, apiKey: v.key } } },
+		}, null, 2);
+		return `
+		<div class="qa-note">ZCode 的配置在两个 JSON 文件里，<b>修改前请完全退出 ZCode</b>（启动时它会整文件重写配置）。密钥已代入下方片段，复制后直接粘贴即可。</div>
+		<ol class="qa-steps">
+			<li>完全退出 ZCode。</li>
+			<li>编辑 <code>~/.zcode/v2/config.json</code>：在顶层 <code>provider</code> 对象里加入 <code>ccb</code> 条目（provider 不存在则在顶层新建）：${codeBlock('"provider": {\n  …原有内容…\n  "ccb": ' + frag + '\n}')}</li>
+			<li>编辑 <code>~/.zcode/cli/config.json</code>：${codeBlock(cli)}</li>
+			<li>保存后启动 ZCode，在模型选择器里选 CCB 供应商下的模型即可。</li>
+		</ol>`;
+	},
+	cursor: (v) => `
+		<div class="qa-note">此为官方「自定义 OpenAI」通道，聊天直接可用；Agent / Composer 等高级功能走 Cursor 官方通道不受影响。</div>
+		<ol class="qa-steps">
+			<li>打开 Cursor，进入 <b>Settings → Models</b>（快捷键 Ctrl+Shift+J）。</li>
+			<li>打开「OpenAI API Key」开关，粘贴上方的 API 密钥。</li>
+			<li>勾选 <b>Override Base URL</b>，粘贴上方的服务地址。</li>
+			<li>点 Verify / Save 通过校验后，在模型列表里选一个 CCB 模型名（如 <code>${esc(v.model)}</code>）即可。</li>
+		</ol>`,
+	codex: (v) => `
+		<div class="qa-note">顶部两行必须写在文件最上面（任何 <code>[表头]</code> 之前），否则会被并入上一个表；<code>wire_api</code> 必须是 <code>responses</code>，写成 chat 会导致应用无法启动。密钥已代入，复制后粘贴到文件顶部即可。</div>
+		<ol class="qa-steps">
+			<li>完全退出 Codex（开始菜单里显示为 ChatGPT）。</li>
+			<li>编辑 <code>~/.codex/config.toml</code>，把下面内容加入文件（顶层两行放最上面）：${codeBlock(`model_provider = "ccb"\nmodel = "${v.model}"\n\n[model_providers.ccb]\nname = "CCB"\nbase_url = "${v.base}"\nwire_api = "responses"\nexperimental_bearer_token = "${v.key}"`)}</li>
+			<li>启动 Codex 即按该模型对话；模型选择器仍显示内置模型属正常（选择器目录由一键配置写入，不影响手动配置生效）。</li>
+		</ol>`,
+	generic: (v) => `
+		<ol class="qa-steps">
+			<li>在客户端的「自定义模型 / BYOK」入口里，选择 OpenAI 兼容类型。</li>
+			<li>粘贴上方的服务地址与 API 密钥，模型名填 <code>${esc(v.model)}</code>。</li>
+			<li>保存后在对话里选用该模型。</li>
+		</ol>
+		<div class="qa-note">若你的客户端不在上列，可到官网 ccb.btluo.com 查看最新支持列表。</div>`,
+};
+MANUAL_GUIDES.codebuddy = MANUAL_GUIDES.workbuddy;
+
+/* Qoder 系桌面版：无法手动接入（服务端权益校验会拒绝），给一键失败的排查步骤 */
+const qoderManualHtml = () => `
+	<div class="qa-note warn">该客户端<b>暂不支持手动配置</b>：它的自定义模型请求由服务端按账号权益校验，手动填入 CCB 地址会被拒绝（表现为对话报「系统发生异常」），必须由 CCB 写入本地桥接补丁后使用。</div>
+	<p>一键配置失败时，按以下步骤排查后重试：</p>
+	<ol class="qa-steps">
+		<li>彻底退出该客户端（包括系统托盘里的后台进程），回到本窗口重新点「一键配置并启动」。</li>
+		<li>仍失败：退出 CCB，右键 CCB 图标选「以管理员身份运行」后重试（客户端装在 C:\\Program Files 等系统目录时必须管理员权限）。</li>
+		<li>检查杀毒软件 / 安全管家是否拦截了对该目录的写入，必要时将 CCB 与该目录加入白名单。</li>
+		<li>仍不行：把该客户端「详情」里的日志内容反馈给我们排查。</li>
+	</ol>`;
+MANUAL_GUIDES.qoderappcn = qoderManualHtml;
+MANUAL_GUIDES.qoderwork = qoderManualHtml;
+
+function manualGuideHtml(c, v) {
+	const g = MANUAL_GUIDES[c.id] || MANUAL_GUIDES[c.writer] || MANUAL_GUIDES.generic;
+	return g(v);
+}
+
+function renderManual() {
+	const sel = $('#manualClient');
+	const c = state.clients.find((x) => x.id === sel.value);
+	if (!c) { $('#manualKeyRow').innerHTML = ''; $('#manualBody').innerHTML = ''; return; }
+	const k = clientKey(c);
+	const base = clientApiBase(c);
+	const key = (k && k.apiKey) || '';
+	$('#manualKeyRow').innerHTML = `
+		<div class="summary">
+			<div class="sum-item"><span class="si-label">服务地址</span><span class="si-value">${esc(base)}</span><button class="btn sm ghost btn-copy" data-copy="${esc(base)}" type="button">复制</button></div>
+			<div class="sum-item"><span class="si-label">API 密钥</span><span class="si-value">${esc(maskedKey(key))}</span><button class="btn sm ghost btn-copy" data-copy="${esc(key)}" type="button" ${key ? '' : 'disabled'}>复制</button></div>
+		</div>`;
+	const model = state.defaultModel || modelIds()[0] || 'glm-5.3';
+	$('#manualBody').innerHTML = manualGuideHtml(c, { base, key: key || 'sk-ccb-你的密钥', model, hasKey: !!key });
+}
+
+async function openManual() {
+	/* 未登录主视图时不可用（密钥依赖账号） */
+	if (!state.user) { toast('请先登录'); return; }
+	/* 下拉选项：全部可见客户端（含未检测到的，用户可能装了但没扫到） */
+	const sel = $('#manualClient');
+	const visible = state.clients.filter((c) => !UNSUPPORTED.has(c.id));
+	sel.innerHTML = visible
+		.map((c) => `<option value="${esc(c.id)}" ${(state.client === c.id) ? 'selected' : ''}>${esc(c.name)}${c.variant ? '（' + esc(c.variant) + '）' : ''}${c.installed ? '' : ' · 未检测到'}</option>`)
+		.join('');
+	/* 默认选中：当前详情客户端 → 第一个已安装 → 第一项 */
+	if (!visible.some((c) => c.id === state.client)) {
+		const first = visible.find((c) => c.installed) || visible[0];
+		if (first) sel.value = first.id;
+	}
+	$('#manualDim').hidden = false;
+	$('#manualModal').hidden = false;
+	renderManual();
+	/* 密钥懒获取：先渲染占位，拿到后刷新（复制按钮解除禁用） */
+	const c = state.clients.find((x) => x.id === sel.value);
+	if (c && c.provider && !state.keys[c.provider]) {
+		await ensureKey(c.provider);
+		renderManual();
+	}
+}
+
+function closeManual() {
+	$('#manualDim').hidden = true;
+	$('#manualModal').hidden = true;
+}
+
 /* ================= 客户端卡片 ================= */
 /* 客户端图标：优先用真实品牌图标（icons/<brand>.png），加载失败回退到字母徽标 */
 function clientIcon(c, cls) {
@@ -1257,6 +1405,11 @@ const HELP_ITEMS = [
 		</ol>`,
 	},
 	{
+		q: '一键配置失败，能不能手动配置？',
+		a: `<p>可以。点第 2 步右上角的「<b>手动配置教程</b>」：选择你的客户端后，会给出该客户端的手动接入步骤，服务地址和 API 密钥都能一键复制。</p>
+		<div class="qa-note">Qoder 系桌面版（Qoder CN / QoderWork）暂不支持手动配置，弹窗里给了对应的失败排查步骤。</div>`,
+	},
+	{
 		q: '其他异常：聊天报错 / 没反应 / 很慢',
 		a: `<ol class="qa-steps">
 			<li>先确认余额大于 0（见第 1 步「账户余额」）。</li>
@@ -1300,6 +1453,19 @@ function bindEvents() {
 	$('#buyCardClose').addEventListener('click', closeBuyCard);
 	$('#buyCardDim').addEventListener('click', closeBuyCard);
 
+	/* 手动配置教程弹窗（遮罩点击 / 关闭按钮 / Escape 均可关闭） */
+	$('#manualBtn').addEventListener('click', openManual);
+	$('#manualClose').addEventListener('click', closeManual);
+	$('#manualDim').addEventListener('click', closeManual);
+	$('#manualClient').addEventListener('change', async () => {
+		renderManual();
+		const c = state.clients.find((x) => x.id === $('#manualClient').value);
+		if (c && c.provider && !state.keys[c.provider]) {
+			await ensureKey(c.provider);
+			renderManual();
+		}
+	});
+
 	$('#applyAllBtn').addEventListener('click', applyAll);
 	$('#rescanBtn').addEventListener('click', rescan);
 
@@ -1321,6 +1487,7 @@ function bindEvents() {
 	$('#guidePrev').addEventListener('click', guidePrev);
 	$('#guideSkip').addEventListener('click', () => endGuide('已跳过引导 · 需要时可点页脚「使用引导」重看'));
 	document.addEventListener('keydown', (e) => {
+		if (e.key === 'Escape' && manualOpen()) { closeManual(); return; }
 		if (e.key === 'Escape' && buyCardOpen()) { closeBuyCard(); return; }
 		if (!guideOpen()) return;
 		if (e.key === 'Escape') endGuide('');

@@ -125,6 +125,7 @@
           </div>
           <div class="step-tools">
             <button class="btn ghost sm" id="rescanBtn" type="button">重新检测</button>
+            <button class="btn ghost sm" id="manualBtn" type="button" title="一键配置失败或不可用时，查看各客户端的手动配置步骤">手动配置教程</button>
           </div>
         </div>
 
@@ -214,6 +215,20 @@
       <div class="shop-url">https://h5.m.taobao.com/awp/core/detail.htm?ft=t&id=1090346436214</div>
     </div>
   </div>
+</div>
+
+<!-- 手动配置教程：一键配置失败/不可用时的自助兜底。选择客户端后展示
+     服务地址与密钥（真实值代入、可复制）及该客户端的手动接入步骤 -->
+<div class="modal-dim" id="manualDim" hidden></div>
+<div class="modal-card manual-card" id="manualModal" role="dialog" aria-labelledby="manualTitle" hidden>
+  <div class="modal-head">
+    <h2 id="manualTitle">手动配置教程</h2>
+    <button class="modal-close" id="manualClose" type="button" aria-label="关闭">×</button>
+  </div>
+  <p class="modal-sub">一键配置不可用或失败时，可按以下步骤在客户端里手动接入 CCB。先选择客户端：</p>
+  <select id="manualClient" class="manual-select" aria-label="选择客户端"></select>
+  <div id="manualKeyRow"></div>
+  <div id="manualBody"></div>
 </div>
 
 <!-- 新手引导：首次进入主界面自动弹出，可跳过，完成后不再展示。
