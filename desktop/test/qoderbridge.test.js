@@ -330,6 +330,62 @@ describe('qoderbridge 补丁 / 回滚（合成 runtime 文件）', () => {
 	});
 });
 
+describe('qoderbridge 写盘失败指引（EPERM/EACCES/EBUSY）', () => {
+	const log = () => {};
+
+	it('isWriteDenied：按 code 与 message 识别权限类错误，其余不命中', () => {
+		expect(qb.isWriteDenied(Object.assign(new Error('x'), { code: 'EPERM' }))).toBe(true);
+		expect(qb.isWriteDenied(Object.assign(new Error('x'), { code: 'EACCES' }))).toBe(true);
+		expect(qb.isWriteDenied(Object.assign(new Error('x'), { code: 'EBUSY' }))).toBe(true);
+		expect(qb.isWriteDenied(new Error('EPERM: operation not permitted'))).toBe(true);
+		expect(qb.isWriteDenied(Object.assign(new Error('x'), { code: 'ENOENT' }))).toBe(false);
+		expect(qb.isWriteDenied(new Error('syntax error'))).toBe(false);
+	});
+
+	it('writeFailureMessage：Windows 给三步排查指引，其他平台给通用提示', () => {
+		const msg = qb.writeFailureMessage(Object.assign(new Error('x'), { code: 'EPERM' }), 'C:\\foo\\runtime.obf.mjs');
+		expect(msg).toContain('EPERM');
+		expect(msg).toContain('C:\\foo\\runtime.obf.mjs');
+		if (process.platform === 'win32') {
+			expect(msg).toContain('彻底退出正在运行的 Qoder CN / QoderWork');
+			expect(msg).toContain('以管理员身份运行');
+			expect(msg).toContain('白名单');
+		} else {
+			expect(msg).toContain('写入权限');
+		}
+	});
+
+	it('withWriteGuard：权限错误翻译成指引，其余错误原样抛出，成功原样返回', () => {
+		expect(() => qb.withWriteGuard(() => {
+			throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+		}, 'C:\\foo')).toThrow(/写入 runtime 文件被系统拒绝（EPERM）/);
+		const other = new Error('disk full');
+		expect(() => qb.withWriteGuard(() => { throw other; }, 'C:\\foo')).toThrow(other);
+		expect(qb.withWriteGuard(() => 42, 'C:\\foo')).toBe(42);
+	});
+
+	it('assertWritable：可写文件通过；不存在路径抛指引文案', () => {
+		const file = path.join(tmpRoot, 'w.mjs');
+		fs.writeFileSync(file, 'x');
+		expect(() => qb.assertWritable(file)).not.toThrow();
+		expect(() => qb.assertWritable(path.join(tmpRoot, 'nope.mjs')))
+			.toThrow(/写入 runtime 文件被系统拒绝/);
+	});
+
+	it('patch：只读 runtime 直接报指引且不产生备份、文件内容不变', () => {
+		const file = path.join(tmpRoot, 'runtime.obf.mjs');
+		fs.writeFileSync(file, SAMPLE);
+		fs.chmodSync(file, 0o444);
+		try {
+			expect(() => qb.patchQoderWorkRuntime(file, log)).toThrow(/写入 runtime 文件被系统拒绝/);
+			expect(fs.readFileSync(file, 'utf8')).toBe(SAMPLE);
+			expect(fs.existsSync(file + '.ccb.bak')).toBe(false);
+		} finally {
+			fs.chmodSync(file, 0o666);
+		}
+	});
+});
+
 describe('qoderbridge 真实 runtime 副本冒烟（未安装则跳过）', () => {
 	it('真实文件：锚点提取 → patch → 幂等 → rollback 字节级往返', () => {
 		const file = qb.findQoderWorkRuntime(CLIENT, () => {});

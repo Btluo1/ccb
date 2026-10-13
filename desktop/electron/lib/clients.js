@@ -137,7 +137,12 @@ const CLIENTS = [
 	{
 		/* TRAE CN（3.4+）：Trae 官方把 TraeCode CN 与 TraeWork CN（TRAE SOLO CN）合并后的
 		 * 单一中国版客户端，IDE 与 SOLO 两种工作模式内置其中；安装目录 / exe / userData /
-		 * ~/.trae-cn 与合并前的 TraeCode CN 完全一致，老用户的自定义路径无需重选。 */
+		 * ~/.trae-cn 与合并前的 TraeCode CN 完全一致，老用户的自定义路径无需重选。
+		 * 2026-10-10（appVersion 3.4.1 / tronBuildVersion 2.3.90452）实测：
+		 * 主窗口是 solo-lite.html（SOLO 形态），CDP 目标里另有一个常驻
+		 * floatingButton.html 浮窗且排第一位；模型选择器回用「旧代」
+		 * .core-model-select-* 前缀；traeui.js 已改为全目标池扫描 + 加载指示器
+		 * 判据适配（详见 traeui.js 头部与 waitForWorkbench 注释）。 */
 		id: 'trae-cn', name: 'TRAE CN', variant: '', vendor: '字节跳动', site: 'trae.cn',
 		glyph: 'T', accent: '#2563eb', mode: 'auto', writer: TRAE_WRITER, provider: 'openai',
 		appDirs: ['Trae CN'],

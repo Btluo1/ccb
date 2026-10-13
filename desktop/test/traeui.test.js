@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 
 /* 与 writers.js 用同一份模块实例，避免出现两份 SEL / 两份逻辑 */
 const require = createRequire(import.meta.url);
-const { displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE } = require('../electron/lib/traeui');
+const { displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE, RPC_FIND_SERVICE, RPC_LIST, buildRpcPayload, isRpcAddSuccess, rpcWaitModelList, addModelsViaRpc } = require('../electron/lib/traeui');
 
 describe('Trae UI 自动化：纯逻辑', () => {
 	it('展示名统一加 CCB 前缀（Trae 列表里混着同名预置模型）', () => {
@@ -204,6 +204,114 @@ class FakeWs {
 		for (const fn of this.listeners.message || []) fn({ data: JSON.stringify(msg) });
 	}
 }
+
+describe('Trae UI 自动化：RPC 直调（方案 A，2026-10-10 实测）', () => {
+	it('两个页面脚本都是合法 JS（求值前先静态校验，改坏立刻暴露）', () => {
+		expect(() => new Function('return ' + RPC_FIND_SERVICE)).not.toThrow();
+		expect(() => new Function('return ' + RPC_LIST)).not.toThrow();
+		/* 取服务脚本必须包含三个实测踩坑的兜底：懒初始化三连、真身模块、双 token 尝试 */
+		expect(RPC_FIND_SERVICE).toContain('prepareModule');
+		expect(RPC_FIND_SERVICE).toContain('injectServiceCollection');
+		expect(RPC_FIND_SERVICE).toContain('bootstrap');
+		expect(RPC_FIND_SERVICE).toContain('_loadedModule');
+		expect(RPC_FIND_SERVICE).toContain("Symbol.for('aiAgent.IAiNativeModelService')");
+		expect(RPC_FIND_SERVICE).toContain('window.__CCB_MODEL_SVC = svc');
+	});
+
+	it('buildRpcPayload 与客户端 UI 提交的字段逐一对齐（bundle 逆向）', () => {
+		const p = buildRpcPayload({ apiBase: 'https://code.btluo.com/v1//', apiKey: 'sk-x' }, 'glm-5.3');
+		expect(p.provider).toBe('custom_openai_compatible');
+		expect(p.model_name).toBe('glm-5.3');
+		expect(p.ak).toBe('sk-x');
+		expect(p.is_custom).toBe(true);
+		expect(p.auth_type).toBe(0);
+		/* 裸 base 自动拼 /chat/completions（等价 UI「拼接」模式），尾部斜杠要归一 */
+		expect(p.base_url).toBe('https://code.btluo.com/v1/chat/completions');
+		expect(p.display_name).toBe('CCB glm-5.3');
+		expect(p.config_detail).toEqual({ multimodal: true, model_hyper_params: { thinking_enable: 0 }, max_turn: 500 });
+	});
+
+	it('isRpcAddSuccess：message==="success" 才算成功；服务层吞错的异常串不算（曾因此误判 29 个全失败）', () => {
+		expect(isRpcAddSuccess({ code: 0, message: 'success' })).toBe(true);
+		expect(isRpcAddSuccess({ code: 0, message: '' })).toBe(true);
+		expect(isRpcAddSuccess({ code: 0 })).toBe(true);
+		/* 吞错形态：{code:0, message:<异常字符串>} */
+		expect(isRpcAddSuccess({ code: 0, message: 'TypeError: network error' })).toBe(false);
+		expect(isRpcAddSuccess({ code: 4028, message: 'failure' })).toBe(false);
+		expect(isRpcAddSuccess({ err: '页面脚本异常' })).toBe(false);
+		expect(isRpcAddSuccess(null)).toBe(false);
+	});
+
+	/** 脚手架：按表达式内容分流预设应答的假 CDP（只实现 RPC 路径用到的方法） */
+	function rpcCdp(respond) {
+		return {
+			evaluate: async (expr) => respond(expr, 'short'),
+			evaluateLong: async (expr) => respond(expr, 'long'),
+		};
+	}
+
+	it('rpcWaitModelList：空列表（凭证未就绪被吞错）先重试，非空后放行', async () => {
+		let n = 0;
+		const cdp = rpcCdp((expr) => {
+			if (expr.includes('getModelList')) {
+				n++;
+				return n < 3
+					? JSON.stringify({ ok: true, total: 0, custom: [] })
+					: JSON.stringify({ ok: true, total: 2, custom: ['custom_openai_compatible//glm-5.3|CCB glm-5.3'] });
+			}
+			/* reset 轮询 */
+			return '';
+		});
+		const r = await rpcWaitModelList(cdp, () => {}, 10000);
+		expect(r.total).toBe(2);
+	}, 20000);
+
+	it('rpcWaitModelList：一直空列表 → 超时抛可读错误（触发上层降级 UI 路径）', async () => {
+		const cdp = rpcCdp(() => JSON.stringify({ ok: true, total: 0, custom: [] }));
+		await expect(rpcWaitModelList(cdp, () => {}, 50)).rejects.toThrow(/超时未就绪/);
+	});
+
+	it('addModelsViaRpc：按 name 与展示名双重去重；吞错 message 判失败不误报成功', async () => {
+		const added = [];
+		const cdp = rpcCdp((expr) => {
+			if (expr.includes('IICubeAiChatModuleManager')) return JSON.stringify({ ok: true, out: {} });
+			if (expr.includes('getModelList')) {
+				return JSON.stringify({
+					ok: true, total: 2,
+					custom: [
+						'custom_openai_compatible//glm-5.3|CCB glm-5.3',
+						'custom_openai_compatible//x|CCB kimi-k3',
+					],
+				});
+			}
+			/* addCustomModel：glm-5.2 正常 success；deepseek-v4-pro 模拟服务层吞错 */
+			if (expr.includes('"model_name":"glm-5.2"')) {
+				added.push('glm-5.2');
+				return JSON.stringify({ code: 0, message: 'success', id: '123' });
+			}
+			if (expr.includes('"model_name":"deepseek-v4-pro"')) {
+				added.push('deepseek-v4-pro');
+				return JSON.stringify({ code: 0, message: 'TypeError: network error' });
+			}
+			throw new Error('unexpected expr: ' + expr.slice(0, 80));
+		});
+		const r = await addModelsViaRpc(cdp, {
+			apiBase: 'https://x/v1', apiKey: 'sk-x',
+			models: ['glm-5.3', 'kimi-k3', 'glm-5.2', 'deepseek-v4-pro'],
+		}, () => {});
+		/* glm-5.3（name 去重）与 kimi-k3（展示名去重）跳过；4-2=2 待添加 */
+		expect(r.skipped).toBe(2);
+		expect(r.added).toBe(1);
+		expect(r.failed).toEqual([expect.stringContaining('deepseek-v4-pro')]);
+		expect(added).toEqual(['glm-5.2', 'deepseek-v4-pro']);
+	});
+
+	it('addModelsViaRpc：找不到服务（新版本 DI 改名）→ 抛错给上层降级 UI', async () => {
+		const cdp = rpcCdp(() => JSON.stringify({ ok: false, err: 'no-module-manager' }));
+		await expect(addModelsViaRpc(cdp, { apiBase: 'https://x/v1', apiKey: 'k', models: ['m'] }, () => {}))
+			.rejects.toThrow(/no-module-manager/);
+	});
+});
 
 describe('Trae UI 自动化：CDP 客户端', () => {
 	it('send 发出请求并把应答交给调用方', async () => {

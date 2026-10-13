@@ -359,8 +359,9 @@ async function writeCodeBuddy(cfg, log, client) {
  *   - 真实来源是服务端 RPC（ModelService → model-list-service），启动即整表重取覆盖本地；
  *   - 实测：写入 171 条 CCB 条目，客户端启动后该键回到写入前的字节级内容（CCB 条目归零）；
  *   - 自定义模型有官方通道（客户端内「设置 → 模型 → 添加模型」，服务端 RPC add_custom_model），
- *     配置存在 Trae 账号下，因此**本地文件写入无效，必须走官方界面**。
- * 所以这里不复刻私有 RPC，而是用 CDP 驱动客户端自己的界面完成添加（见 traeui.js）。
+ *     配置存在 Trae 账号下，因此**本地文件写入无效，必须走官方通道**。
+ * 走法是复用客户端自己的网络栈（见 traeui.js）：优先页面内直调其 ModelAPIService RPC
+ * （2026-10-10 方案 A，零 UI 点击），不可用时降级 CDP 驱动「添加模型」界面点击提交。
  */
 async function writeTraeUi(cfg, log, client, detected) {
 	const exe = findLaunchExe(client, detected);

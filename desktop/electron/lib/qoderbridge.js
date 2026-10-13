@@ -546,9 +546,51 @@ function findQoderWorkRuntime(client, log) {
 
 /* ---------- 补丁 / 回滚 ---------- */
 
+/* 写盘失败指引（2026-10-13 用户报障：macOS /Applications 下 EPERM 原文被直接甩给用户，
+ * Windows 同理——装在 Program Files 或杀软拦截时只会收到一行 EPERM 原文，无从下手）。
+ * 权限类错误统一翻译为可操作的排查步骤；其余异常原样上抛。 */
+function isWriteDenied(e) {
+	const s = String((e && (e.code || e.message)) || '');
+	return /EPERM|EACCES|EBUSY/.test(s);
+}
+
+function writeFailureMessage(e, file) {
+	const code = (e && e.code) || 'UNKNOWN';
+	if (process.platform === 'win32') {
+		return (
+			`写入 runtime 文件被系统拒绝（${code}）：${file}。请依次排查后重试：` +
+			'①彻底退出正在运行的 Qoder CN / QoderWork（含系统托盘图标），再重新一键配置；' +
+			'②仍失败则退出 CCB，右键 CCB 图标「以管理员身份运行」后重试' +
+			'（客户端装在 C:\\Program Files 等系统目录时，普通权限无法改写其文件）；' +
+			'③检查杀毒软件/安全管家是否拦截了对该目录的写入，必要时将 CCB 与该目录加入白名单。'
+		);
+	}
+	return `写入 runtime 文件被系统拒绝（${code}）：${file}。请确认对该文件所在目录有写入权限后重试。`;
+}
+
+/** 写前可写性预检：无权限时 fail-fast（不浪费时间跑锚点，错误即指引） */
+function assertWritable(file) {
+	try {
+		fs.accessSync(file, fs.constants.W_OK);
+	} catch (e) {
+		throw new Error(writeFailureMessage(e, file));
+	}
+}
+
+/** 包一层写盘操作，权限类错误翻译成指引文案，其余原样抛出 */
+function withWriteGuard(fn, file) {
+	try {
+		return fn();
+	} catch (e) {
+		if (isWriteDenied(e)) throw new Error(writeFailureMessage(e, file));
+		throw e;
+	}
+}
+
 /** 补丁指定 runtime 文件。返回 true=已写入或已是最新；失败 throw（文件保持原样）。 */
 function patchQoderWorkRuntime(file, log) {
 	if (!fs.existsSync(file)) throw new Error(`runtime 文件不存在：${file}`);
+	assertWritable(file);
 	const src = fs.readFileSync(file, 'utf8');
 	const hadAny = src.indexOf(MARK_BEGIN) >= 0 || src.indexOf(GUARD_BEGIN) >= 0
 		|| src.indexOf(PGUARD_MARK) >= 0 || src.indexOf(RGUARD_MARK) >= 0
@@ -615,10 +657,12 @@ function patchQoderWorkRuntime(file, log) {
 		log('QoderWork runtime 补丁已存在且为最新，无需重写。');
 		return true;
 	}
-	/* 备份（恒为首次写入前的原始状态），再写盘 */
+	/* 备份（恒为首次写入前的原始状态），再写盘；权限类失败给出排查指引 */
 	const bak = file + BACKUP_SUFFIX;
-	if (!fs.existsSync(bak)) fs.copyFileSync(file, bak);
-	fs.writeFileSync(file, out, 'utf8');
+	withWriteGuard(() => {
+		if (!fs.existsSync(bak)) fs.copyFileSync(file, bak);
+		fs.writeFileSync(file, out, 'utf8');
+	}, file);
 	/* 语法安全网：校验失败时用内存里的原始内容还原（不依赖备份，防版本错配） */
 	const chk = spawnSync('node', ['--check', file], { encoding: 'utf8' });
 	if (chk.error) {
@@ -638,9 +682,10 @@ function patchQoderWorkRuntime(file, log) {
 /** 回滚指定 runtime 文件。优先还原 .ccb.bak；无备份则按标记剥离。返回是否有修改。 */
 function rollbackQoderWorkRuntime(file, log) {
 	if (!fs.existsSync(file)) return false;
+	assertWritable(file);
 	const bak = file + BACKUP_SUFFIX;
 	if (fs.existsSync(bak)) {
-		fs.copyFileSync(bak, file);
+		withWriteGuard(() => fs.copyFileSync(bak, file), file);
 		syncFastUpdateManifest(file, log);
 		log(`已从备份还原 ${path.basename(file)}`
 			+ `（若 QoderWork 本身升级过，旧备份可能不再匹配，请改用「重新写入配置」）。`);
@@ -654,7 +699,7 @@ function rollbackQoderWorkRuntime(file, log) {
 	out = stripXlGuard(out);
 	out = stripBridge(out);
 	if (out === src) return false;
-	fs.writeFileSync(file, out, 'utf8');
+	withWriteGuard(() => fs.writeFileSync(file, out, 'utf8'), file);
 	/* 剥离是注入的逆操作，仅在 node 可用时顺手校验；失败则用内存原内容还原 */
 	const chk = spawnSync('node', ['--check', file], { encoding: 'utf8' });
 	if (!chk.error && chk.status !== 0) {
@@ -708,4 +753,5 @@ module.exports = {
 	extractXlPatch, xlSpanSource, stripXlGuard, applyXlPatch,
 	findQoderWorkRuntime, patchQoderWorkRuntime, rollbackQoderWorkRuntime,
 	ensureQoderWorkBridge, removeQoderWorkBridge,
+	isWriteDenied, writeFailureMessage, assertWritable, withWriteGuard,
 };
