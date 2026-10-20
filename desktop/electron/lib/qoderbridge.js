@@ -133,14 +133,19 @@ const XL_CN_ANCHOR = '[defaultModelCache] Failed to write cache:';
 const XL_CN_FN_RE = /async function ([\w$]+)\(A\)\{let e=\{key:A\.key,uid:A\.uid,scene:A\.scene,updatedAt:Date\.now\(\)\}/;
 const CCB_MODEL_PREFIX = 'ccb/';
 
-/* exe → worker runtime 的相对路径（app.asar.unpacked 内，可直接写） */
-const RUNTIME_RELPATH = path.join(
-	'resources', 'app.asar.unpacked', 'node_modules', '@qoder-ai',
-	'qoder-agent-sdk', 'dist', '_worker', 'qoder-worker-runtime.obf.mjs'
-);
+/* worker runtime 在 app 根目录下的相对路径（app.asar.unpacked 内，可直接写）。
+ * SDK 包名有两种，必须都认（2026-10-20 实测：Qoder CN 桌面版用 qoder-cn-agent-sdk，
+ * 此前只认 qoder-agent-sdk → 桌面版的「exe 同级探测」永远落空，只能靠日志兜底）。 */
+const SDK_PACKAGES = ['qoder-agent-sdk', 'qoder-cn-agent-sdk'];
+const WORKER_RELPATH = ['dist', '_worker', 'qoder-worker-runtime.obf.mjs'];
+/* Qoder CN 桌面版的 fast-update 会把新版整包铺在 <安装根>\.qoder-versions\<版本>\ 下，
+ * 客户端实际加载的是其中的副本（实测日志：F:\Qoder CN\.qoder-versions\0.4.8\...） */
+const VERSIONS_DIR = '.qoder-versions';
 
-/* SDK 日志里 worker runtime 路径的输出格式（路径可能含空格，不能按空白截断） */
+/* SDK 日志里 worker runtime 路径的输出格式（路径可能含空格，不能按空白截断）。
+ * 两个 SDK 的日志文件名不同，都认（Qoder CN 桌面版实为 qoder-agent-sdk.log）。 */
 const LOG_LINE_RE = /Using asar-unpacked worker runtime: (.+)/g;
+const LOG_NAMES = ['qoder-agent-sdk.log', 'qoder-cn-agent-sdk.log'];
 
 /* ---------- 桥函数源码（注入 worker ESM 顶层作用域） ----------
  * 约束：不 import（fetch/AbortController/TextDecoder 均为 Node 全局）；
@@ -485,63 +490,110 @@ function syncFastUpdateManifest(workerFile, log) {
 
 /* ---------- 定位 worker runtime ---------- */
 
-function runtimeFromExe(exe) {
-	const p = path.join(path.dirname(exe), RUNTIME_RELPATH);
-	return fs.existsSync(p) ? p : null;
+/** 版本号比较（0.4.10 > 0.4.9，按段数值而非字符串） */
+function cmpVersion(a, b) {
+	const pa = String(a).split('.').map(Number);
+	const pb = String(b).split('.').map(Number);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const d = (pa[i] || 0) - (pb[i] || 0);
+		if (d) return d;
+	}
+	return 0;
 }
 
-/** 日志兜底：解析 SDK 日志里的「Using asar-unpacked worker runtime: <path>」，
- *  取最新日志文件中的最后一次记录（覆盖自定义安装路径的场景）。 */
-function runtimeFromLogs(client) {
-	const dir = ((client && client.appDirs) || [])[0];
-	if (!dir) return null;
-	const logRoot = path.join(APPDATA, dir, 'logs');
-	if (!fs.existsSync(logRoot)) return null;
-	let best = null;
-	let bestMtime = 0;
+/** .qoder-versions 下的版本目录名，升序（0.4.7, 0.4.8, …）；无则空数组 */
+function listVersionDirs(installDir) {
+	let entries;
+	try { entries = fs.readdirSync(path.join(installDir, VERSIONS_DIR), { withFileTypes: true }); } catch { return []; }
+	return entries
+		.filter((e) => e.isDirectory() && /^\d+(\.\d+)*$/.test(e.name))
+		.map((e) => e.name)
+		.sort(cmpVersion);
+}
+
+/** 一个 app 根目录下两种 SDK 包名的 worker runtime 路径 */
+function sdkWorkerPaths(appRoot) {
+	return SDK_PACKAGES.map((pkg) =>
+		path.join(appRoot, 'resources', 'app.asar.unpacked', 'node_modules', '@qoder-ai', pkg, ...WORKER_RELPATH));
+}
+
+/** 安装根目录下全部候选 worker runtime 路径（不校验存在），按「最可能是客户端实际加载的那份」排序：
+ *  1) .qoder-versions\<最高版本>\resources\...（Qoder CN 桌面版 fast-update 生效副本）
+ *  2) <安装根>\resources\...（原始安装副本；QoderWork 只有这一份） */
+function runtimeCandidatesIn(installDir) {
+	const out = [];
+	for (const v of listVersionDirs(installDir).reverse()) {
+		out.push(...sdkWorkerPaths(path.join(installDir, VERSIONS_DIR, v)));
+	}
+	out.push(...sdkWorkerPaths(installDir));
+	return out;
+}
+
+/** 日志兜底：解析 SDK 日志里的「Using asar-unpacked worker runtime: <path>」。
+ *  取最新日志、最新记录优先（覆盖自定义安装路径与 fast-update 版本目录切换）；
+ *  日志里指向的文件可能已被升级清理，故只收存在的、并去重。
+ *  logRoot 仅测试注入用（默认 <APPDATA>\<appDirs[0]>\logs）。 */
+function runtimesFromLogs(client, logRoot) {
+	if (!logRoot) {
+		const dir = ((client && client.appDirs) || [])[0];
+		if (!dir) return [];
+		logRoot = path.join(APPDATA, dir, 'logs');
+	}
+	if (!fs.existsSync(logRoot)) return [];
+	const found = [];
 	const walk = (d) => {
 		let entries;
 		try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
 		for (const ent of entries) {
 			const p = path.join(d, ent.name);
-			if (ent.isDirectory()) walk(p);
-			else if (ent.name === 'qoder-agent-sdk.log') {
-				let mtimeMs;
-				try { mtimeMs = fs.statSync(p).mtimeMs; } catch { continue; }
-				if (mtimeMs <= bestMtime) continue;
-				let text;
-				try { text = fs.readFileSync(p, 'utf8'); } catch { continue; }
-				const hits = [...text.matchAll(LOG_LINE_RE)];
-				if (!hits.length) continue;
-				const file = hits[hits.length - 1][1].trim();
-				if (file && fs.existsSync(file)) {
-					best = file;
-					bestMtime = mtimeMs;
-				}
-			}
+			if (ent.isDirectory()) { walk(p); continue; }
+			if (!LOG_NAMES.includes(ent.name)) continue;
+			let mtimeMs;
+			try { mtimeMs = fs.statSync(p).mtimeMs; } catch { continue; }
+			let text;
+			try { text = fs.readFileSync(p, 'utf8'); } catch { continue; }
+			const hits = [...text.matchAll(LOG_LINE_RE)].map((m) => m[1].trim()).filter(Boolean);
+			if (hits.length) found.push({ mtimeMs, hits });
 		}
 	};
 	walk(logRoot);
-	return best;
-}
-
-/** 定位 QoderWork 的 worker runtime mjs（exe 同级 resources → 日志兜底），找不到返回 null */
-function findQoderWorkRuntime(client, log) {
-	const exe = findExeEverywhere(((client && client.exeNames) || []));
-	if (exe) {
-		const hit = runtimeFromExe(exe);
-		if (hit) {
-			log(`定位 worker runtime：${hit}`);
-			return hit;
+	found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	const out = [];
+	for (const f of found) {
+		for (let i = f.hits.length - 1; i >= 0; i--) {
+			const p = f.hits[i];
+			if (fs.existsSync(p) && !out.includes(p)) out.push(p);
 		}
 	}
-	const hit = runtimeFromLogs(client);
-	if (hit) {
-		log(`从日志定位 worker runtime：${hit}`);
-		return hit;
+	return out;
+}
+
+/** 定位 QoderWork / Qoder CN 的 worker runtime，返回存在的候选文件列表（优先级从高到低）。
+ *  首选 exe 同级的安装目录探测（不依赖日志），均无结果时再走日志兜底。
+ *  返回多个候选的原因：fast-update 的版本目录副本与原始安装副本都可能被加载，
+ *  只补一处会在客户端切换版本后失效——调用方对全部候选打补丁。 */
+function findQoderWorkRuntimes(client, log) {
+	const out = [];
+	const exe = findExeEverywhere(((client && client.exeNames) || []));
+	if (exe) {
+		for (const p of runtimeCandidatesIn(path.dirname(exe))) {
+			if (fs.existsSync(p) && !out.includes(p)) out.push(p);
+		}
+		if (out.length) log(`定位 worker runtime：${out[0]}`);
 	}
-	log('未定位到 QoderWork worker runtime（exe 探测与日志解析均无结果）。');
-	return null;
+	if (!out.length) {
+		for (const p of runtimesFromLogs(client)) {
+			if (!out.includes(p)) out.push(p);
+		}
+		if (out.length) log(`从日志定位 worker runtime：${out[0]}`);
+	}
+	if (!out.length) log('未定位到 Qoder worker runtime（安装目录探测与日志解析均无结果）。');
+	return out;
+}
+
+/** 兼容入口：返回优先级最高的 runtime 路径，无则 null */
+function findQoderWorkRuntime(client, log) {
+	return findQoderWorkRuntimes(client, log)[0] || null;
 }
 
 /* ---------- 补丁 / 回滚 ---------- */
@@ -714,7 +766,7 @@ function rollbackQoderWorkRuntime(file, log) {
 
 /* ---------- writers.js 集成入口 ---------- */
 
-/** 写入配置后调用：定位 runtime 并打补丁。失败 throw（调用方决定整体语义）。 */
+/** 写入配置后调用：定位 runtime 并打补丁。返回 true=至少写入一处；失败 throw（调用方决定整体语义）。 */
 function ensureQoderWorkBridge(client, log) {
 	/* 显式跳过开关：格式类测试（roundtrip / dialogue-e2e）在合成环境验证
 	 * customs/agents.db/默认模型的写入格式，桥接另有专测（qoderbridge.test.js
@@ -723,23 +775,36 @@ function ensureQoderWorkBridge(client, log) {
 		log('CCB_QW_BRIDGE=off：跳过 QoderWork runtime 桥接。');
 		return false;
 	}
-	const file = findQoderWorkRuntime(client, log);
-	if (!file) {
-		throw new Error('未定位到 QoderWork worker runtime，桥接补丁未生效（请先安装并启动一次 QoderWork 再重新写入配置）');
+	const name = (client && client.name) || '客户端';
+	const files = findQoderWorkRuntimes(client, log);
+	if (!files.length) {
+		throw new Error(`未定位到 ${name} 的 worker runtime，桥接补丁未生效（请先安装并启动一次 ${name} 再重新写入配置）`);
 	}
-	return patchQoderWorkRuntime(file, log);
+	/* 多个候选（fast-update 版本目录副本 + 原始安装副本）都要补，否则客户端切版本后补丁失效。
+	 * 首个候选是客户端实际加载的那份：它失败必须如实上抛；其余候选尽力而为，失败只记日志。 */
+	let ok = 0;
+	for (let i = 0; i < files.length; i++) {
+		try {
+			if (patchQoderWorkRuntime(files[i], log)) ok++;
+		} catch (e) {
+			if (i === 0) throw e;
+			log(`提示：另一份 worker runtime 补丁失败（${files[i]}）：${e.message}`);
+		}
+	}
+	return ok > 0;
 }
 
 /** 回滚时调用：定位 runtime 并还原。失败只记日志，不让回滚整体失败。 */
 function removeQoderWorkBridge(client, log) {
-	const file = findQoderWorkRuntime(client, log);
-	if (!file) return false;
-	try {
-		return rollbackQoderWorkRuntime(file, log);
-	} catch (e) {
-		log(`QoderWork runtime 桥回滚失败：${e.message}`);
-		return false;
+	let changed = false;
+	for (const file of findQoderWorkRuntimes(client, log)) {
+		try {
+			if (rollbackQoderWorkRuntime(file, log)) changed = true;
+		} catch (e) {
+			log(`QoderWork runtime 桥回滚失败（${file}）：${e.message}`);
+		}
 	}
+	return changed;
 }
 
 module.exports = {
@@ -751,7 +816,10 @@ module.exports = {
 	extractReconcilePatch, reconcileSpanSource, stripReconcileGuard, applyReconcilePatch,
 	extractFactoryPatch, factoryWrapperSource, stripFactoryWrapper, applyFactoryWrapper,
 	extractXlPatch, xlSpanSource, stripXlGuard, applyXlPatch,
-	findQoderWorkRuntime, patchQoderWorkRuntime, rollbackQoderWorkRuntime,
+	SDK_PACKAGES, WORKER_RELPATH, VERSIONS_DIR, LOG_NAMES,
+	findQoderWorkRuntime, findQoderWorkRuntimes, runtimeCandidatesIn, sdkWorkerPaths,
+	listVersionDirs, cmpVersion, runtimesFromLogs,
+	patchQoderWorkRuntime, rollbackQoderWorkRuntime,
 	ensureQoderWorkBridge, removeQoderWorkBridge,
 	isWriteDenied, writeFailureMessage, assertWritable, withWriteGuard,
 };

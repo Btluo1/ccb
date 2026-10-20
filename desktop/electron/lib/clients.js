@@ -185,6 +185,9 @@ const CLIENTS = [
 		appDirs: ['com.qodercn.app.stable'],
 		exeNames: ['Qoder CN.exe'],
 		homeDir: '.qoder-cn',
+		/* ~/.qoder-cn 与 Qoder CN IDE 共用（IDE 亦写入该目录），仅凭它存在不足以判定桌面版
+		 * 已安装——只装 IDE 的用户会误判为已安装，点一键配置后在 worker runtime 桥接处失败 */
+		homeDirShared: true,
 	},
 	{
 		/* QoderWork（对话式客户端，非 IDE）聊天走内置 @qoder-ai/qoder-agent-sdk 的
@@ -657,8 +660,12 @@ function detectOne(c, customPaths) {
 		const dir = path.join(HOME, c.homeDir);
 		result.details.homeDir = dir;
 		if (exists(dir)) {
-			result.installed = true;
-			result.evidence.push(`数据目录：${dir}`);
+			/* homeDirShared：该目录与同产品线的另一个客户端共用（Qoder CN 桌面版与
+			 * Qoder CN IDE 共用 ~/.qoder-cn），存在它并不代表本客户端装了——只装 IDE
+			 * 的用户会看到桌面版卡片「已安装」，点配置后必然在运行时补丁处失败。
+			 * 这类客户端只认可执行文件/数据目录证据，homeDir 仅作展示。 */
+			if (!c.homeDirShared) result.installed = true;
+			result.evidence.push(`数据目录：${dir}${c.homeDirShared ? '（与同产品线客户端共用，不作为已安装依据）' : ''}`);
 		}
 	}
 

@@ -330,6 +330,109 @@ describe('qoderbridge 补丁 / 回滚（合成 runtime 文件）', () => {
 	});
 });
 
+describe('qoderbridge runtime 定位（SDK 包名 / fast-update 版本目录 / 日志兜底）', () => {
+	it('两种 SDK 包名都作为候选（Qoder CN 桌面版用 qoder-cn-agent-sdk）', () => {
+		// 回归防护：2026-10-20 用户报障——桌面版运行时补丁永远失败。
+		// 根因：只认 qoder-agent-sdk，而桌面版实际包名是 qoder-cn-agent-sdk。
+		expect(qb.SDK_PACKAGES).toContain('qoder-agent-sdk');
+		expect(qb.SDK_PACKAGES).toContain('qoder-cn-agent-sdk');
+		const paths = qb.sdkWorkerPaths('C:\\App');
+		expect(paths.length).toBe(qb.SDK_PACKAGES.length);
+		for (const p of paths) {
+			expect(p.endsWith(path.join('@qoder-ai', 'qoder-cn-agent-sdk', 'dist', '_worker', 'qoder-worker-runtime.obf.mjs'))
+				|| p.endsWith(path.join('@qoder-ai', 'qoder-agent-sdk', 'dist', '_worker', 'qoder-worker-runtime.obf.mjs'))).toBe(true);
+			expect(p).toContain(path.join('resources', 'app.asar.unpacked', 'node_modules', '@qoder-ai'));
+		}
+	});
+
+	it('cmpVersion 按段数值比较，字符串序不算数（0.4.10 应大于 0.4.9）', () => {
+		expect(qb.cmpVersion('0.4.10', '0.4.9')).toBeGreaterThan(0);
+		expect(qb.cmpVersion('0.4.9', '0.4.10')).toBeLessThan(0);
+		expect(qb.cmpVersion('0.4.8', '0.4.8')).toBe(0);
+		expect(qb.cmpVersion('1.0', '0.9.9')).toBeGreaterThan(0);
+	});
+
+	it('listVersionDirs 只认版本号目录并升序返回；目录不存在时返回空数组', () => {
+		const root = path.join(tmpRoot, 'install');
+		fs.mkdirSync(path.join(root, '.qoder-versions', '0.4.10'), { recursive: true });
+		fs.mkdirSync(path.join(root, '.qoder-versions', '0.4.9'), { recursive: true });
+		fs.mkdirSync(path.join(root, '.qoder-versions', '0.4.7'), { recursive: true });
+		fs.writeFileSync(path.join(root, '.qoder-versions', '0.4.8.qoder-update-ready.json'), '{}');
+		expect(qb.listVersionDirs(root)).toEqual(['0.4.7', '0.4.9', '0.4.10']);
+		expect(qb.listVersionDirs(path.join(tmpRoot, 'nope'))).toEqual([]);
+	});
+
+	it('runtimeCandidatesIn：版本目录副本优先（版本从高到低），原始安装副本垫底', () => {
+		const root = path.join(tmpRoot, 'install');
+		const rel = (ver, pkg) => path.join(
+			...(ver ? [ '.qoder-versions', ver ] : []),
+			'resources', 'app.asar.unpacked', 'node_modules', '@qoder-ai', pkg, 'dist', '_worker', 'qoder-worker-runtime.obf.mjs',
+		);
+		fs.mkdirSync(path.join(root, '.qoder-versions', '0.4.7'), { recursive: true });
+		fs.mkdirSync(path.join(root, '.qoder-versions', '0.4.8'), { recursive: true });
+		const list = qb.runtimeCandidatesIn(root);
+		expect(list).toEqual([
+			path.join(root, rel('0.4.8', 'qoder-agent-sdk')),
+			path.join(root, rel('0.4.8', 'qoder-cn-agent-sdk')),
+			path.join(root, rel('0.4.7', 'qoder-agent-sdk')),
+			path.join(root, rel('0.4.7', 'qoder-cn-agent-sdk')),
+			path.join(root, rel(null, 'qoder-agent-sdk')),
+			path.join(root, rel(null, 'qoder-cn-agent-sdk')),
+		]);
+	});
+
+	it('日志兜底：两个日志文件名都认，最新日志优先，只收仍存在的路径并去重', () => {
+		const logRoot = path.join(tmpRoot, 'logs', '20261017-043106', 'qodercli');
+		fs.mkdirSync(logRoot, { recursive: true });
+		const oldRuntime = path.join(tmpRoot, 'old-version.mjs');
+		const newRuntime = path.join(tmpRoot, 'new-version.mjs');
+		fs.writeFileSync(oldRuntime, 'x');
+		fs.writeFileSync(newRuntime, 'x');
+		fs.writeFileSync(
+			path.join(logRoot, 'qoder-agent-sdk.log'),
+			'Using asar-unpacked worker runtime: ' + oldRuntime + '\n'
+				+ 'Using asar-unpacked worker runtime: ' + path.join(tmpRoot, 'deleted-version.mjs') + '\n',
+		);
+		const newer = path.join(tmpRoot, 'logs', '20261018-101010');
+		fs.mkdirSync(newer, { recursive: true });
+		fs.writeFileSync(
+			path.join(newer, 'qoder-cn-agent-sdk.log'),
+			'Using asar-unpacked worker runtime: ' + newRuntime + '\n'
+				+ 'Using asar-unpacked worker runtime: ' + newRuntime + '\n',
+		);
+		/* 显式拉开 mtime：同一毫秒内创建的日志文件 sort 顺序不保证（曾导致偶发失败） */
+		const oldLog = path.join(logRoot, 'qoder-agent-sdk.log');
+		const newLog = path.join(newer, 'qoder-cn-agent-sdk.log');
+		fs.utimesSync(oldLog, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+		fs.utimesSync(newLog, new Date(), new Date());
+		const dir = path.join(tmpRoot, 'logs');
+		const hits = qb.runtimesFromLogs({ appDirs: ['x'] }, dir);
+		expect(hits).toEqual([newRuntime, oldRuntime]); /* 新日志优先；不存在的路径与重复项被剔除 */
+		/* 引用已被升级清理的版本目录时不得返回（否则后续 patch 会写坏/报不存在） */
+		expect(hits).not.toContain(path.join(tmpRoot, 'deleted-version.mjs'));
+	});
+
+	it('日志兜底：无日志目录 / 无 runtime 行时返回空数组', () => {
+		expect(qb.runtimesFromLogs({ appDirs: ['x'] }, path.join(tmpRoot, 'absent'))).toEqual([]);
+		const dir = path.join(tmpRoot, 'logs-empty');
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, 'qoder-agent-sdk.log'), 'nothing here\n');
+		fs.writeFileSync(path.join(dir, 'other.log'), 'Using asar-unpacked worker runtime: /x\n');
+		expect(qb.runtimesFromLogs({ appDirs: ['x'] }, dir)).toEqual([]);
+	});
+
+	it('未安装（无 exe、无日志）时返回空列表，且报错按客户端名而非一律 QoderWork', () => {
+		const client = {
+			id: 'qoder-app-cn', name: 'Qoder CN',
+			appDirs: ['ccb-nonexistent-appdir'], exeNames: ['ccb-nonexistent.exe'],
+		};
+		expect(qb.findQoderWorkRuntimes(client, () => {})).toEqual([]);
+		expect(qb.findQoderWorkRuntime(client, () => {})).toBe(null);
+		expect(() => qb.ensureQoderWorkBridge(client, () => {}))
+			.toThrow(/未定位到 Qoder CN 的 worker runtime/);
+	});
+});
+
 describe('qoderbridge 写盘失败指引（EPERM/EACCES/EBUSY）', () => {
 	const log = () => {};
 

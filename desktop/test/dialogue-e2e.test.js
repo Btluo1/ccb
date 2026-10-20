@@ -428,4 +428,22 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 			expect(CLIENTS.some((c) => c.id === id && c.writer === w), `客户端 ${id} 的写入器应为 ${w}`).toBe(true);
 		}
 	});
+
+	it('共用 homeDir 的客户端必须标 homeDirShared（否则同产品线的另一客户端会造成误判已安装）', () => {
+		/* 事故（2026-10-20 用户报障）：Qoder CN 桌面版与 Qoder CN IDE 共用 ~/.qoder-cn，
+		 * 只装 IDE 的用户在卡片上看到桌面版「已安装」，点一键配置后必然在
+		 * worker runtime 桥接处失败（运行时装在 IDE 没有的安装目录里）。 */
+		const byHome = new Map();
+		for (const c of CLIENTS) {
+			if (!c.homeDir) continue;
+			const prev = byHome.get(c.homeDir);
+			if (prev) {
+				expect(c.homeDirShared || prev.homeDirShared,
+					`${prev.id} 与 ${c.id} 共用 homeDir ${c.homeDir}，至少一方需标 homeDirShared`).toBe(true);
+			} else {
+				byHome.set(c.homeDir, c);
+			}
+		}
+		expect(CLIENTS.find((c) => c.id === 'qoder-app-cn').homeDirShared).toBe(true);
+	});
 });
