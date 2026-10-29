@@ -16,6 +16,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const { Cdp, findFreePort } = require('./traeui');
 const { spawn } = require('child_process');
 
@@ -66,7 +67,9 @@ function buildWriteScript(providerId, modelId) {
 	})()`;
 }
 
-/** 模型指示器当前显示的文字（composer 附近形如「CCB/glm-5.3」） */
+/** 模型指示器当前显示的文字（composer 附近形如「CCB/glm-5.3」）。
+ *  家族正则只用于「找到长得像指示器的元素」，是否生效由 buildIndicatorScript /
+ *  调用方的精确匹配兜底——单靠这里的正则会把 glm-5 误判命中 glm-5.3。 */
 const INDICATOR_SCRIPT = `(function(){
 	try{
 		var els=document.querySelectorAll('button,[role=button],div,span');
@@ -79,6 +82,25 @@ const INDICATOR_SCRIPT = `(function(){
 		return '';
 	}catch(e){ return '' }
 })()`;
+
+/** 精确匹配目标模型的指示器脚本：只认「相等或以 / 分隔结尾的完整模型名」
+ *  （指示器文本形如「CCB/glm-5.3」，取末段与模型名全等比较）。
+ *  旧实现用家族正则 + 子串匹配，glm-5 会命中 glm-5.3，造成误判生效。 */
+function buildIndicatorScript(modelId) {
+	return `(function(){
+		try{
+			var els=document.querySelectorAll('button,[role=button],div,span');
+			for(var i=0;i<els.length;i++){
+				var v=(els[i].innerText||'').trim();
+				if(v && v.length<40 && /\\//.test(v) && els[i].offsetWidth){
+					var tail=v.split('/').pop().trim();
+					if(tail===${JSON.stringify(modelId)}) return v;
+				}
+			}
+			return '';
+		}catch(e){ return '' }
+	})()`;
+}
 
 /** 读回指定键的原始值 */
 function buildReadScript(key) {
@@ -98,12 +120,18 @@ function buildRemoveScript(key) {
 /* ---------- 驱动 ---------- */
 
 function launchWithDebugPort(exePath, port) {
+	/* spawn 前先校验路径：exe 不存在时 spawn 会异步触发 error 事件，没有监听者
+	 * 会作为未捕获异常击穿 Electron 主进程 */
+	if (!fs.existsSync(exePath)) throw new Error(`未找到程序位置：${exePath}`);
 	const child = spawn(exePath, [`--remote-debugging-port=${port}`], {
 		detached: true,
 		stdio: 'ignore',
 		cwd: path.dirname(exePath),
 		env: process.env,
 	});
+	/* 启动失败只记日志：客户端拉不起来时后续 Cdp.connect 会以可读错误收尾，
+	 * error 事件无人监听会击穿主进程 */
+	child.on('error', (e) => console.error(`[zcodeui] 客户端启动失败：${e.message || e}`));
 	child.unref();
 }
 
@@ -179,21 +207,22 @@ async function selectDefaultModel({ exePath, providerId, modelId, label, log }) 
 		await waitFor(cdp, `typeof window.__ccbMark === 'undefined'`, 60000, '页面刷新');
 		await waitFor(cdp, READY_SCRIPT, 90000, '主界面（刷新后）');
 
-		/* 会话视图（composer）打开时轮询读模型指示器；没有会话视图就无法直观确认 */
+		/* 会话视图（composer）打开时轮询读模型指示器；没有会话视图就无法直观确认。
+		 * 指示器用精确匹配脚本：只认完整模型名，避免 glm-5 命中 glm-5.3 的误判 */
 		let verified = false;
 		let shown = '';
 		const deadline = Date.now() + 20000;
 		while (Date.now() < deadline) {
 			const hasComposer = await cdp.evaluate(`!!document.querySelector(${JSON.stringify(COMPOSER_SELECTOR)})`).catch(() => false);
 			if (hasComposer) {
-				shown = (await cdp.evaluate(INDICATOR_SCRIPT)) || '';
+				shown = (await cdp.evaluate(buildIndicatorScript(modelId))) || '';
 				if (shown) break;
 			} else {
 				shown = '';
 			}
 			await sleep(1000);
 		}
-		if (shown && shown.includes(modelId)) {
+		if (shown) {
 			log(`默认模型已生效：${name} 当前使用「${shown}」`);
 			return { ok: true, model: shown, entries };
 		}
@@ -202,9 +231,18 @@ async function selectDefaultModel({ exePath, providerId, modelId, label, log }) 
 		const back = entries.length
 			? await cdp.evaluate(buildReadScript(entries[0].key))
 			: await cdp.evaluate(buildReadScript(CONFIG_KEY_PREFIX + 'glm:__global__'));
-		const ok = typeof back === 'string' && back.includes(modelId);
+		/* 读回校验同样要精确匹配完整模型名：值形如 {"model":"custom:<provider>:<model>"}，
+		 * 用 ':<modelId>"' 界定结尾，子串匹配会把 glm-5 误判命中 glm-5.3 */
+		const ok = typeof back === 'string' && back.includes(`:${modelId}"`);
 		if (ok) log('默认模型已写入（当前界面没有会话视图，未能直观确认），打开客户端发一条消息即可验证。');
-		return { ok, model: ok ? '' : shown, unverified: true, entries };
+		return {
+			ok,
+			model: ok ? '' : shown,
+			unverified: true,
+			entries,
+			/* 校验失败要给用户可操作的指引：硬编码键名在客户端改版后可能静默失效 */
+			...(ok ? {} : { error: '写入后读回校验未通过（当前客户端版本可能与 CCB 不兼容，请更新 CCB 后重试）' }),
+		};
 	} catch (e) {
 		return { ok: false, error: e.message || String(e) };
 	} finally {
@@ -259,5 +297,6 @@ module.exports = {
 	CONFIG_KEY_PREFIX,
 	COMPOSER_SELECTOR,
 	INDICATOR_SCRIPT,
+	buildIndicatorScript,
 	SNAPSHOT_SCRIPT,
 };

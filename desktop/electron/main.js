@@ -208,9 +208,11 @@ function encryptQoderSecret(plaintext) {
 			if (!settled) { settled = true; resolve(v); }
 		};
 		try {
-			const child = spawn(process.execPath, buildScriptArgs(app.isPackaged, script, 'encrypt', plaintext), {
+			/* 密钥走 stdin 而非 argv：命令行参数对同用户的任意进程可见
+			 *（wmic / Process Explorer 都能读到），sk-ccb 明文不能出现在那里 */
+			const child = spawn(process.execPath, buildScriptArgs(app.isPackaged, script, 'encrypt'), {
 				env,
-				stdio: ['ignore', 'pipe', 'ignore'],
+				stdio: ['pipe', 'pipe', 'ignore'],
 				windowsHide: true,
 			});
 			const timer = setTimeout(() => {
@@ -228,6 +230,15 @@ function encryptQoderSecret(plaintext) {
 					done(null);
 				}
 			});
+			try {
+				child.stdin.write(plaintext);
+				child.stdin.end();
+			} catch (e) {
+				clearTimeout(timer);
+				console.log('[qoder-secret] stdin 写入失败：', e.message || e);
+				try { child.kill(); } catch {}
+				done(null);
+			}
 		} catch (e) {
 			console.log('[qoder-secret] spawn 失败：', e.message || e);
 			done(null);
@@ -341,6 +352,23 @@ async function ensureQoderProxy(opts = {}) {
 	return r.ok ? { ok: true, mode: 'inprocess' } : r;
 }
 
+/* pidfile 里的 PID 可能是 runner 退出后被系统复用的无关进程——直接 kill 会误杀。
+ * 先按 PID 反查映像名，确认是 CCB 自身（开发模式 electron.exe / 打包版 CCB.exe，
+ * runner 都是用 process.execPath 拉起的）才允许结束。 */
+function pidImageName(pid) {
+	try {
+		const { spawnSync } = require('child_process');
+		const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], {
+			encoding: 'utf8', timeout: 8000, windowsHide: true,
+		});
+		if (r.status !== 0 || !r.stdout) return null;
+		const m = /^\s*"([^"]+\.exe)"/i.exec(r.stdout.split(/\r?\n/)[0] || '');
+		return m ? m[1] : null;
+	} catch {
+		return null;
+	}
+}
+
 function stopQoderProxy() {
 	qoderproxy.stop();
 	/* 常驻 runner：kill 进程 + 删 pidfile（runner 心跳也会自退）双保险 */
@@ -348,7 +376,12 @@ function stopQoderProxy() {
 		const f = qoderProxyPidFile();
 		const pid = Number((fs.readFileSync(f, 'utf8') || '').trim());
 		if (pid && pid !== process.pid) {
-			try { process.kill(pid); } catch {}
+			const selfImage = path.basename(process.execPath).toLowerCase();
+			const image = (pidImageName(pid) || '').toLowerCase();
+			/* 映像名查不到（进程已退出/无权限）时宁缺勿杀；只杀与自身同名的进程 */
+			if (image && (image === selfImage || image === 'electron.exe')) {
+				try { process.kill(pid); } catch {}
+			}
 		}
 		fs.rmSync(f);
 	} catch {}
@@ -470,10 +503,30 @@ ipcMain.handle('key:verify', async (_e, apiBase, apiKey) => {
 	}
 });
 
+/* ---------- 客户端级互斥锁 ----------
+ * 用户连点「一键配置 / 重新写入 / 回滚」时，两路流程会并行：同时 kill 客户端、
+ * 同时写同一份配置文件/数据库、拉两个调试端口实例互踩。配置与回滚按 clientId
+ * 串行化（不同客户端之间互不阻塞），保证任何时刻同一客户端只有一路写流程。 */
+const clientLocks = new Map();
+function withClientLock(clientId, fn) {
+	const prev = clientLocks.get(clientId) || Promise.resolve();
+	const next = prev.catch(() => {}).then(fn);
+	clientLocks.set(clientId, next);
+	/* 链尾清理，防止 Map 无限增长（客户端 id 有限，双保险） */
+	next.finally(() => {
+		if (clientLocks.get(clientId) === next) clientLocks.delete(clientId);
+	});
+	return next;
+}
+
 ipcMain.handle('config:apply', async (_e, clientId, cfg) => {
 	if (typeof clientId !== 'string' || !cfg || typeof cfg !== 'object') {
 		return { ok: false, error: '参数无效' };
 	}
+	return withClientLock(clientId, () => applyConfigLocked(clientId, cfg));
+});
+
+async function applyConfigLocked(clientId, cfg) {
 	/* Trae 系写入器需要可执行文件路径（要带调试端口启动客户端），从检测结果里取 */
 	const detected = detectClients(store.load().customPaths || {}).find((c) => c.id === clientId);
 	const mitm =
@@ -528,17 +581,19 @@ ipcMain.handle('config:apply', async (_e, clientId, cfg) => {
 		}
 	}
 	return result;
-});
+}
 
 ipcMain.handle('config:rollback', (_e, clientId) => {
 	if (typeof clientId !== 'string') return { ok: false, error: '参数无效' };
-	/* WorkBuddy 回滚要还原界面上的默认模型（localStorage），同样需要可执行文件路径 */
-	const detected = detectClients(store.load().customPaths || {}).find((c) => c.id === clientId);
-	if (clientId === 'cursor') cursorproxy.stop();
-	/* Qoder CN IDE：回滚时停掉本地代理（进程内 + 常驻 runner + 自启动项）；
-	 * writers.rollbackQoder 会移除 settings.json 里的代理字段 */
-	if (clientId === 'qoder-cn') stopQoderProxy();
-	return rollbackConfig(clientId, detected);
+	return withClientLock(clientId, async () => {
+		/* WorkBuddy 回滚要还原界面上的默认模型（localStorage），同样需要可执行文件路径 */
+		const detected = detectClients(store.load().customPaths || {}).find((c) => c.id === clientId);
+		if (clientId === 'cursor') cursorproxy.stop();
+		/* Qoder CN IDE：回滚时停掉本地代理（进程内 + 常驻 runner + 自启动项）；
+		 * writers.rollbackQoder 会移除 settings.json 里的代理字段 */
+		if (clientId === 'qoder-cn') stopQoderProxy();
+		return rollbackConfig(clientId, detected);
+	});
 });
 
 /* ---------- Cursor MITM 代理（模仿 cursor-agent：settings.json → 本地代理 → CCB 中转） ---------- */

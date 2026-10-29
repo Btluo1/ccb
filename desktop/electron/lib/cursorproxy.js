@@ -39,7 +39,14 @@ const state = {
 	upstream: null /* { baseUrl, apiKey, models, defaultModel } */,
 	handlers: new Map() /* connect 全路径 -> async handler(ctx) */,
 	stats: { intercepted: 0, tunneled: 0, passthrough: 0 },
+	sockets: new Set() /* 活跃连接集合：stop() 时整体销毁，否则存量连接挂着端口成僵尸 */,
 };
+
+/* 登记活跃 socket，关闭时自动移除 */
+function trackSocket(s) {
+	state.sockets.add(s);
+	s.on('close', () => state.sockets.delete(s));
+}
 
 function log(msg) {
 	try {
@@ -53,6 +60,7 @@ function caPaths() {
 		dir: path.join(state.dataDir, 'cursor-proxy'),
 		key: path.join(state.dataDir, 'cursor-proxy', 'ca-key.pem'),
 		cert: path.join(state.dataDir, 'cursor-proxy', 'ca-cert.pem'),
+		meta: path.join(state.dataDir, 'cursor-proxy', 'ca-meta.json'),
 	};
 }
 
@@ -65,7 +73,8 @@ function generateCa() {
 	cert.serialNumber = crypto.randomBytes(16).toString('hex');
 	cert.validity.notBefore = new Date(Date.now() - 86400000);
 	cert.validity.notAfter = new Date();
-	cert.validity.notAfter.setFullYear(cert.validity.notAfter.getFullYear() + 10);
+	/* 根 CA 有效期不宜过长：泄露窗口越长风险越大，2 年与站点证书一致，到期重新生成即可 */
+	cert.validity.notAfter.setFullYear(cert.validity.notAfter.getFullYear() + 2);
 	const attrs = [
 		{ name: 'commonName', value: 'CCB Local Proxy CA' },
 		{ name: 'organizationName', value: 'CCB' },
@@ -86,6 +95,21 @@ function generateCa() {
 	};
 }
 
+/** Windows 下把 CA 私钥文件 ACL 收紧为仅当前用户完全控制（失败仅记日志，不影响主流程） */
+function restrictKeyAcl(keyPath) {
+	if (os.platform() !== 'win32') return;
+	try {
+		const r = spawnSync(
+			'icacls',
+			[keyPath, '/inheritance:r', '/grant:r', `${os.userInfo().username}:F`],
+			{ windowsHide: true },
+		);
+		if (r.status !== 0) log(`CA 私钥权限收紧失败（icacls 退出码 ${r.status}）`);
+	} catch (e) {
+		log(`CA 私钥权限收紧异常：${e.message}`);
+	}
+}
+
 /** 确保证书存在（从磁盘加载或重新生成） */
 function ensureCa(logFn) {
 	if (logFn) state.log = logFn;
@@ -102,6 +126,7 @@ function ensureCa(logFn) {
 				keyObj: forge.pki.privateKeyFromPem(keyPem),
 				certObj: forge.pki.certificateFromPem(certPem),
 			};
+			restrictKeyAcl(p.key); /* 存量私钥也补一次权限收紧 */
 			return state.ca;
 		} catch (e) {
 			log(`根证书读取失败（${e.message}），重新生成`);
@@ -110,15 +135,45 @@ function ensureCa(logFn) {
 	state.ca = generateCa();
 	fs.writeFileSync(p.key, state.ca.keyPem, { mode: 0o600 });
 	fs.writeFileSync(p.cert, state.ca.certPem);
+	restrictKeyAcl(p.key);
 	log(`根证书已保存到 ${p.dir}`);
 	return state.ca;
 }
 
-function caThumbprint() {
+/** 证书指纹（hex 大写）：sha1 供 certutil 检索，sha256 持久化到 ca-meta.json */
+function caFingerprint(kind) {
 	ensureCa();
 	const forge = require('node-forge');
 	const der = forge.asn1.toDer(forge.pki.certificateToAsn1(state.ca.certObj)).getBytes();
-	return crypto.createHash('sha1').update(Buffer.from(der, 'binary')).digest('hex').toUpperCase();
+	return crypto.createHash(kind).update(Buffer.from(der, 'binary')).digest('hex').toUpperCase();
+}
+
+function caThumbprint() {
+	return caFingerprint('sha1');
+}
+
+function readCaMeta() {
+	try {
+		return JSON.parse(fs.readFileSync(caPaths().meta, 'utf8'));
+	} catch {
+		return null;
+	}
+}
+
+/** 安装时持久化证书指纹：卸载优先按它删 Root 条目，而不是依赖当前文件重算 */
+function writeCaMeta() {
+	try {
+		fs.writeFileSync(
+			caPaths().meta,
+			JSON.stringify({
+				sha1: caFingerprint('sha1'),
+				sha256: caFingerprint('sha256'),
+				installedAt: new Date().toISOString(),
+			}),
+		);
+	} catch (e) {
+		log(`ca-meta.json 写入失败：${e.message}`);
+	}
 }
 
 /** 是否已安装进当前用户根证书库
@@ -127,9 +182,13 @@ function caThumbprint() {
  * 比对需忽略大小写（否则装了也永远显示未安装）。 */
 function isCaInstalled() {
 	if (os.platform() !== 'win32') return false;
-	const tp = caThumbprint();
-	const r = spawnSync('certutil', ['-user', '-store', 'Root', tp], { encoding: 'utf8' });
-	return r.status === 0 && (r.stdout || '').toLowerCase().includes(tp.toLowerCase());
+	try {
+		const tp = caThumbprint();
+		const r = spawnSync('certutil', ['-user', '-store', 'Root', tp], { encoding: 'utf8' });
+		return r.status === 0 && (r.stdout || '').toLowerCase().includes(tp.toLowerCase());
+	} catch {
+		return false;
+	}
 }
 
 /** 安装到当前用户根证书库（certutil -user，免管理员；Windows 会弹一次安全警告，需用户确认） */
@@ -137,12 +196,19 @@ function installCa(logFn) {
 	if (logFn) state.log = logFn;
 	if (os.platform() !== 'win32') return { ok: false, error: '目前仅支持 Windows' };
 	ensureCa();
+	writeCaMeta();
 	if (isCaInstalled()) {
 		log('根证书已在当前用户证书库中');
 		return { ok: true, already: true };
 	}
 	const p = caPaths();
-	const r = spawnSync('certutil', ['-user', '-addstore', 'Root', p.cert], { encoding: 'utf8' });
+	let r;
+	try {
+		r = spawnSync('certutil', ['-user', '-addstore', 'Root', p.cert], { encoding: 'utf8' });
+	} catch (e) {
+		log(`根证书安装异常：${e.message}`);
+		return { ok: false, error: e.message };
+	}
 	if (r.status !== 0) {
 		const msg = `${r.stdout || ''}${r.stderr || ''}`.trim();
 		log(`根证书安装失败：${msg}`);
@@ -155,10 +221,29 @@ function installCa(logFn) {
 function uninstallCa(logFn) {
 	if (logFn) state.log = logFn;
 	if (os.platform() !== 'win32') return { ok: false, error: '目前仅支持 Windows' };
-	if (!state.ca && !fs.existsSync(caPaths().cert)) return { ok: true };
-	const tp = caThumbprint();
-	const r = spawnSync('certutil', ['-user', '-delstore', 'Root', tp], { encoding: 'utf8' });
-	if (r.status === 0) log('已从当前用户证书库移除 CCB 根证书');
+	const p = caPaths();
+	if (!state.ca && !fs.existsSync(p.cert) && !fs.existsSync(p.meta)) return { ok: true };
+	/* 优先用安装时持久化的指纹删 Root 条目；meta 缺失再按当前证书文件重算 */
+	const meta = readCaMeta();
+	const tp = (meta && (meta.sha1 || meta.sha256)) || caThumbprint();
+	let r;
+	try {
+		r = spawnSync('certutil', ['-user', '-delstore', 'Root', tp], { encoding: 'utf8' });
+	} catch (e) {
+		log(`根证书卸载异常：${e.message}`);
+		return { ok: false, error: e.message };
+	}
+	if (r.status === 0) {
+		log('已从当前用户证书库移除 CCB 根证书');
+		/* 卸载后清掉本地 CA 材料：私钥继续落盘只会扩大攻击面 */
+		for (const f of [p.key, p.cert, p.meta]) {
+			try {
+				fs.unlinkSync(f);
+			} catch {}
+		}
+		state.ca = null;
+		state.certCache.clear();
+	}
 	return { ok: r.status === 0 };
 }
 
@@ -224,7 +309,11 @@ function frameParser(onFrame) {
 			if (flags & 1) {
 				try {
 					data = zlib.gunzipSync(data);
-				} catch {}
+				} catch (e) {
+					/* 解压失败不能当明文静默上交（下游按 protobuf 解只会得到垃圾），
+					 * 记日志并按原始字节透传 */
+					log(`帧 gzip 解压失败，按原始字节透传：${e.message}`);
+				}
 			}
 			onFrame({ endStream: !!(flags & 0x02), data });
 			if (flags & 0x02) buf = Buffer.alloc(0);
@@ -256,7 +345,10 @@ function passthrough(host, port, req, res, bodyChunks) {
 		headers: { ...req.headers, host },
 	};
 	delete options.headers['proxy-authorization'];
-	const up = https.request(options, (upRes) => {
+	/* 非 CONNECT 的明文代理请求目标是 http://（或 80 端口），必须走 http.request；
+	 * 无条件用 https.request 会对明文端口发 TLS 握手，必然失败表现为 502 */
+	const usePlainHttp = port === 80 || /^http:\/\//i.test(req.url || '');
+	const up = (usePlainHttp ? http : https).request(options, (upRes) => {
 		res.writeHead(upRes.statusCode || 502, upRes.headers);
 		upRes.pipe(res);
 	});
@@ -274,7 +366,7 @@ function passthrough(host, port, req, res, bodyChunks) {
 /* ---------- 请求路由 ---------- */
 const router = {
 	/** 返回 true 表示已接管 */
-	async handle(host, req, res, bodyChunks) {
+	async handle(host, port, req, res, bodyChunks) {
 		const u = new URL(req.url, `https://${host}`);
 		const handler = state.handlers.get(u.pathname);
 		if (handler) {
@@ -290,6 +382,8 @@ const router = {
 				log,
 				encodeFrame,
 				connectError,
+				/* 端点解析失败时兜底：把原始请求原样转给真实后端 */
+				passthrough: () => passthrough(host, port, req, res, bodyChunks),
 			};
 			/* 流式请求体按帧解析收集 */
 			const frames = [];
@@ -325,7 +419,7 @@ function handlePlainRequest(host, port) {
 		const chunks = [];
 		req.on('data', (c) => chunks.push(c));
 		req.on('end', async () => {
-			const taken = await router.handle(host, req, res, chunks);
+			const taken = await router.handle(host, port, req, res, chunks);
 			if (!taken) {
 				log(`↪ 转发 ${host}${req.url}`);
 				passthrough(host, port, req, res, chunks);
@@ -339,6 +433,7 @@ function mitmSocket(clientSocket, host, port) {
 	const { key, cert } = siteCert(host);
 	const ctx = tls.createSecureContext({ key, cert });
 	const secure = new tls.TLSSocket(clientSocket, { isServer: true, secureContext: ctx });
+	trackSocket(secure); /* TLS 包装是独立对象，也要纳入 stop() 的销毁范围 */
 	secure.on('error', (e) => {
 		log(`TLS 终结失败 ${host}：${e.message}`);
 		clientSocket.destroy();
@@ -346,7 +441,7 @@ function mitmSocket(clientSocket, host, port) {
 	/* 复用一个临时 http.Server 解析 HTTP/1.1（settings 里已禁用 HTTP/2） */
 	const srv = new http.Server();
 	srv.on('request', handlePlainRequest(host, port));
-	srv.on('error', () => {});
+	srv.on('error', (e) => log(`内置 HTTP 解析器错误（${host}）：${e.message}`));
 	srv.emit('connection', secure);
 }
 
@@ -362,7 +457,12 @@ function tunnel(clientSocket, host, port) {
 }
 
 function onProxyConnection(socket) {
+	trackSocket(socket);
+	/* 连上后迟迟不发首字节的空挂连接：30s 后销毁，避免句柄越积越多 */
+	const headTimer = setTimeout(() => socket.destroy(), 30000);
+	if (headTimer.unref) headTimer.unref();
 	socket.once('data', (head) => {
+		clearTimeout(headTimer);
 		socket.pause();
 		const line = head.toString('latin1', 0, head.indexOf('\r\n'));
 		const m = /^CONNECT\s+([^\s:]+)(?::(\d+))?\s+HTTP/i.exec(line);
@@ -385,7 +485,7 @@ function onProxyConnection(socket) {
 			const hostPort = m2[1].split(':');
 			const srv = new http.Server();
 			srv.on('request', handlePlainRequest(hostPort[0], Number(hostPort[1]) || 80));
-			srv.on('error', () => {});
+			srv.on('error', (e) => log(`明文代理请求解析错误（${m2[1]}）：${e.message}`));
 			socket.unshift(head);
 			srv.emit('connection', socket);
 			return;
@@ -417,6 +517,10 @@ function start(opts = {}) {
 	state.server = net.createServer(onProxyConnection);
 	state.server.on('error', (e) => {
 		log(`代理监听失败（端口 ${state.port}）：${e.message}`);
+		/* 先 close 再置空：直接置空会让监听句柄残留，下次 start 必 EADDRINUSE */
+		try {
+			state.server.close();
+		} catch {}
 		state.server = null;
 	});
 	return new Promise((resolve) => {
@@ -429,11 +533,19 @@ function start(opts = {}) {
 }
 
 function stop() {
-	if (!state.server) return { ok: true };
-	try {
-		state.server.close();
-	} catch {}
-	state.server = null;
+	if (state.server) {
+		/* close() 只停止接收新连接，存量连接不销毁的话端口/句柄会一直挂着（端口僵尸） */
+		try {
+			state.server.close();
+		} catch {}
+		state.server = null;
+	}
+	for (const s of state.sockets) {
+		try {
+			s.destroy();
+		} catch {}
+	}
+	state.sockets.clear();
 	log('CCB Cursor 代理已停止');
 	return { ok: true };
 }

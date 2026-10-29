@@ -10,8 +10,13 @@
  */
 const CHARS_PER_TOKEN = 4;
 
+/* CJK 与全角标点在主流 tokenizer 里约 1 字 1 token，按「字符数 ÷ 4」会把中文低估约 4 倍 */
+const CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/g;
+
 function estimateTokens(text) {
-	return Math.ceil(String(text == null ? '' : text).length / CHARS_PER_TOKEN);
+	const s = String(text == null ? '' : text);
+	const cjk = (s.match(CJK_RE) || []).length;
+	return cjk + Math.ceil((s.length - cjk) / CHARS_PER_TOKEN);
 }
 
 /** 消息数组的估算 token（每条另加 4 作为角色/分隔开销） */
@@ -64,6 +69,10 @@ const SUMMARY_SYSTEM =
 const SUMMARY_USER_PREFIX = '以下是需要压缩的对话片段：\n\n';
 const SUMMARY_USER_SUFFIX = '\n\n请输出摘要（不要复述原文）。';
 
+/* 压缩整体单独限 30s：不能套用上游聊天的长超时（默认 600s），
+ * 否则上游挂起时客户端要干等 10 分钟。超时/失败一律 fail-open 走原消息 */
+const COMPRESS_TIMEOUT_MS = 30000;
+
 /**
  * 需要时压缩 messages；返回 { messages, compressed, tokens, after }
  * 任何一步失败都退回原始 messages —— 压缩是优化，不能因为它把聊天搞挂。
@@ -80,10 +89,11 @@ async function compressMessages({ messages, upstream, model, log = () => {}, sig
 	const plan = planCompression(messages, cfg.tailTurns || 20);
 	if (!plan) return { messages, compressed: false, tokens: before, after: before };
 
-	const { completeOnce } = require('./cursorupstream');
+	const { completeOnce, withTimeout } = require('./cursorupstream');
 	const chunks = chunkByChars(plan.older, cfg.summaryMaxCharsPerChunk || 30000);
 	log(`上下文约 ${before} token，超过阈值 ${Math.round(limit * (cfg.threshold || 0.8))}，开始压缩 ${plan.older.length} 条历史（${chunks.length} 块）`);
 
+	const guard = withTimeout(signal, cfg.summaryTimeoutMs || COMPRESS_TIMEOUT_MS);
 	try {
 		const parts = [];
 		for (const chunk of chunks) {
@@ -94,7 +104,7 @@ async function compressMessages({ messages, upstream, model, log = () => {}, sig
 					{ role: 'user', content: SUMMARY_USER_PREFIX + renderChunk(chunk) + SUMMARY_USER_SUFFIX },
 				],
 				maxTokens: cfg.summaryMaxTokens || 2048,
-				signal,
+				signal: guard.signal,
 			});
 			if (text && text.trim()) parts.push(text.trim());
 		}
@@ -112,7 +122,7 @@ async function compressMessages({ messages, upstream, model, log = () => {}, sig
 					{ role: 'user', content: SUMMARY_USER_PREFIX + summary + SUMMARY_USER_SUFFIX },
 				],
 				maxTokens: cfg.summaryMaxTokens || 2048,
-				signal,
+				signal: guard.signal,
 			});
 			if (merged && merged.trim()) summary = merged.trim();
 		}
@@ -128,6 +138,8 @@ async function compressMessages({ messages, upstream, model, log = () => {}, sig
 	} catch (e) {
 		log(`上下文压缩失败（按原文转发）：${e.message}`);
 		return { messages, compressed: false, tokens: before, after: before };
+	} finally {
+		guard.done();
 	}
 }
 
