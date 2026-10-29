@@ -69,13 +69,37 @@ function log(msg) {
 	try { state.log(msg); } catch {}
 }
 
+/* ---------- 诊断 dump：默认关闭（内容含明文密钥/响应体，落盘有泄露风险），
+ * 仅 CCB_QODER_DEBUG=1 时启用；开启也一律脱敏 sk-ccb-* ---------- */
+function debugDumpEnabled() {
+	return process.env.CCB_QODER_DEBUG === '1';
+}
+function redactSecrets(text) {
+	return String(text).replace(/sk-ccb-[A-Za-z0-9_-]+/g, 'sk-ccb-***');
+}
+
 /* ---------- 根 CA（与 cursor-proxy 同目录同一张证书，装一次两边通用） ---------- */
 function caPaths() {
 	return {
 		dir: path.join(state.dataDir, 'cursor-proxy'),
 		key: path.join(state.dataDir, 'cursor-proxy', 'ca-key.pem'),
 		cert: path.join(state.dataDir, 'cursor-proxy', 'ca-cert.pem'),
+		meta: path.join(state.dataDir, 'cursor-proxy', 'ca-meta.json'),
 	};
+}
+
+/** 收紧 CA 私钥文件 ACL：去掉继承、仅授权当前用户完全控制。
+ *  私钥若被其他本机账户读到，配合已装入根证书库的 CA 即可 MITM 本机任意 HTTPS。
+ *  失败仅记日志，不阻断主流程（权限问题不影响代理本身工作）。 */
+function protectCaKey(keyPath) {
+	if (os.platform() !== 'win32') return;
+	try {
+		const username = os.userInfo().username;
+		const r = spawnSync('icacls', [keyPath, '/inheritance:r', '/grant:r', `${username}:F`], { windowsHide: true, encoding: 'utf8' });
+		if (r.status !== 0) log(`ca-key.pem 权限收紧失败：${(r.stderr || r.stdout || '').trim()}`);
+	} catch (e) {
+		log(`ca-key.pem 权限收紧异常：${e.message}`);
+	}
 }
 
 function generateCa() {
@@ -87,7 +111,9 @@ function generateCa() {
 	cert.serialNumber = crypto.randomBytes(16).toString('hex');
 	cert.validity.notBefore = new Date(Date.now() - 86400000);
 	cert.validity.notAfter = new Date();
-	cert.validity.notAfter.setFullYear(cert.validity.notAfter.getFullYear() + 10);
+	/* 有效期 10 年 → 2 年：根证书会装进用户根证书库且私钥留存本机，
+	 * 缩短有效期以缩小私钥泄露后的可利用窗口 */
+	cert.validity.notAfter.setFullYear(cert.validity.notAfter.getFullYear() + 2);
 	const attrs = [
 		{ name: 'organizationName', value: 'CCB' },
 		{ name: 'commonName', value: 'CCB Local Proxy CA' },
@@ -122,12 +148,15 @@ function ensureCa() {
 				keyObj: forge.pki.privateKeyFromPem(keyPem),
 				certObj: forge.pki.certificateFromPem(certPem),
 			};
+			/* 既有私钥也补做 ACL 收紧（老版本生成时未加保护） */
+			protectCaKey(p.key);
 			return state.ca;
 		} catch (e) {
 			log(`根证书读取失败（${e.message}），重新生成`);
 		}
 	}
 	const { keyObj, certObj } = generateCa();
+	protectCaKey(p.key);
 	state.ca = {
 		keyPem: fs.readFileSync(p.key, 'utf8'),
 		certPem: fs.readFileSync(p.cert, 'utf8'),
@@ -144,6 +173,26 @@ function caThumbprint() {
 	return crypto.createHash('sha1').update(Buffer.from(der, 'binary')).digest('hex').toUpperCase();
 }
 
+/** 证书 DER 的 SHA256（持久化到 ca-meta.json，卸载时凭它定位 Root 库条目） */
+function caSha256() {
+	ensureCa();
+	const forge = require('node-forge');
+	const der = forge.asn1.toDer(forge.pki.certificateToAsn1(state.ca.certObj)).getBytes();
+	return crypto.createHash('sha256').update(Buffer.from(der, 'binary')).digest('hex');
+}
+
+/** 安装成功后把证书指纹落盘：卸载时证书文件可能已被清理/替换，
+ *  持久化指纹是唯一可靠的删除依据（兜底才按当前文件重算）。 */
+function persistCaMeta() {
+	try {
+		const p = caPaths();
+		fs.mkdirSync(p.dir, { recursive: true });
+		fs.writeFileSync(p.meta, JSON.stringify({ sha256: caSha256(), sha1: caThumbprint(), installedAt: new Date().toISOString() }, null, 2));
+	} catch (e) {
+		log(`ca-meta.json 写入失败：${e.message}`);
+	}
+}
+
 /** 是否已安装进当前用户根证书库（certutil 查不到 exit 也是 0 且中文系统输出小写哈希，需忽略大小写比对） */
 function isCaInstalled() {
 	if (os.platform() !== 'win32') return false;
@@ -158,6 +207,7 @@ function installCa() {
 	ensureCa();
 	if (isCaInstalled()) {
 		log('根证书已在当前用户证书库中');
+		persistCaMeta();
 		return { ok: true, already: true };
 	}
 	const p = caPaths();
@@ -168,16 +218,34 @@ function installCa() {
 		return { ok: false, error: msg || 'certutil 失败' };
 	}
 	log('根证书已安装到当前用户证书库（如弹出安全警告请点「是」）');
+	persistCaMeta();
 	return { ok: true };
 }
 
 function uninstallCa() {
 	if (os.platform() !== 'win32') return { ok: false, error: '目前仅支持 Windows' };
-	if (!state.ca && !fs.existsSync(caPaths().cert)) return { ok: true };
-	const tp = caThumbprint();
-	const r = spawnSync('certutil', ['-user', '-delstore', 'Root', tp], { encoding: 'utf8' });
-	if (r.status === 0) log('已从当前用户证书库移除 CCB 根证书');
-	return { ok: r.status === 0 };
+	const p = caPaths();
+	if (!state.ca && !fs.existsSync(p.cert) && !fs.existsSync(p.meta)) return { ok: true };
+	/* 优先用安装时持久化的指纹删 Root 库条目（证书文件可能已被清理/替换），
+	 * 兜底再按当前证书文件重算 sha1 指纹 */
+	const tps = [];
+	try {
+		const meta = JSON.parse(fs.readFileSync(p.meta, 'utf8'));
+		if (meta && meta.sha256) tps.push(String(meta.sha256));
+		if (meta && meta.sha1) tps.push(String(meta.sha1));
+	} catch { /* 无 meta 文件 */ }
+	try { tps.push(caThumbprint()); } catch { /* 证书文件也不在了 */ }
+	let ok = false;
+	for (const tp of tps) {
+		const r = spawnSync('certutil', ['-user', '-delstore', 'Root', tp], { encoding: 'utf8' });
+		if (r.status === 0) { ok = true; break; }
+	}
+	if (ok) log('已从当前用户证书库移除 CCB 根证书');
+	/* 卸载后删除本地 CA 材料：残留私钥 + 已入库证书 = 持久 MITM 风险 */
+	for (const f of [p.key, p.cert, p.meta]) { try { fs.rmSync(f, { force: true }); } catch {} }
+	state.ca = null;
+	state.certCache.clear();
+	return { ok };
 }
 
 function siteCert(host) {
@@ -233,23 +301,49 @@ function setModels(models) {
 	} catch {}
 }
 
-/** 设置 CCB 中转站基址（注入到 ccb provider 的 base_url）；空值忽略。
+/** 校验并规整 CCB 中转地址，非法返回 null：
+ *  - 仅接受 https://（本机开发 127.0.0.1 / localhost / [::1] 允许 http://）
+ *  - 拒绝 IP 字面量主机（仅放行回环）：公网 IP 直连多为误配，且无法按域名做证书校验
+ *  - 去掉尾部斜杠，丢弃 query/hash */
+function normalizeRelayBaseUrl(url) {
+	if (typeof url !== 'string' || !url.trim()) return null;
+	let u;
+	try { u = new URL(url.trim()); } catch { return null; }
+	const hn = u.hostname.toLowerCase();
+	const isV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hn);
+	const isV6 = hn === '[::1]' || hn.includes(':');
+	const isLoopback = hn === '127.0.0.1' || hn === 'localhost' || hn === '[::1]';
+	if ((isV4 || isV6) && !isLoopback) return null;
+	if (u.protocol === 'http:') {
+		if (!isLoopback) return null;
+	} else if (u.protocol !== 'https:') return null;
+	return u.origin + u.pathname.replace(/\/+$/, '');
+}
+
+/** 设置 CCB 中转站基址（注入到 ccb provider 的 base_url）；空值忽略，非法值拒绝并返回 false。
  *  同时落盘 qoder-relay.json：detached runner 是独立进程，setRelayBaseUrl 只改
  *  本进程内存时它永远收不到（2026-10-01 实测：apply 传了本地 8788，runner 仍把
  *  sk-ccb 请求重定向到默认生产地址）。文件是唯一可靠的跨进程通道，与
  *  qoder-models.json 的模型清单同一模式。 */
 function setRelayBaseUrl(url) {
-	if (typeof url !== 'string' || !url) return;
-	state.relayBaseUrl = url;
+	if (typeof url !== 'string' || !url) return false;
+	const norm = normalizeRelayBaseUrl(url);
+	if (!norm) {
+		/* 宁可沿用旧值也不把用户的 sk-ccb 密钥转发到不可信端点 */
+		log(`拒绝非法 relay 地址：${JSON.stringify(url)}（仅接受 https，回环开发可用 http）`);
+		return false;
+	}
+	state.relayBaseUrl = norm;
 	try {
 		fs.mkdirSync(state.dataDir, { recursive: true });
 		const p = path.join(state.dataDir, 'qoder-relay.json');
-		const want = JSON.stringify(url);
+		const want = JSON.stringify(norm);
 		/* 同值跳过写入：runner 的文件 watch 会因 setRelayBaseUrl 自身落盘而再次
 		 * 触发，若不加保护会形成「写→watch→读→写」无限循环 */
-		try { if (fs.readFileSync(p, 'utf8') === want) return; } catch {}
+		try { if (fs.readFileSync(p, 'utf8') === want) return true; } catch {}
 		fs.writeFileSync(p, want);
 	} catch {}
+	return true;
 }
 
 /** 启动时读落盘的 relay 地址（runner / CCB 重启后恢复） */
@@ -257,8 +351,13 @@ function loadRelayBaseUrl() {
 	try {
 		const v = JSON.parse(fs.readFileSync(path.join(state.dataDir, 'qoder-relay.json'), 'utf8'));
 		if (typeof v === 'string' && v) {
-			state.relayBaseUrl = v;
-			log(`已加载 relay 地址：${v}`);
+			const norm = normalizeRelayBaseUrl(v);
+			if (norm) {
+				state.relayBaseUrl = norm;
+				log(`已加载 relay 地址：${norm}`);
+			} else {
+				log(`qoder-relay.json 中的 relay 地址非法，忽略：${v}`);
+			}
 		}
 	} catch { /* 无文件：保持默认 */ }
 }
@@ -365,10 +464,21 @@ function injectByokConfig(bodyText) {
 		}
 	}
 	/* 注入/替换我们的 custom provider（模板取任意预定义 provider，保证字段形状一致） */
+	const existing = json.providers.find((p) => p && p.key === 'custom');
+	if (existing) {
+		/* 幂等检测：existing 的模型集合已与本次清单一致时跳过重建，
+		 * 否则重复注入会把 stats.injected 刷高（且 already 分支恒为死代码） */
+		const have = new Set();
+		for (const t of existing.types || []) {
+			for (const m of (t && t.models) || []) have.add(m && m.key);
+		}
+		if (have.size === state.models.length && state.models.every((k) => have.has(k))) {
+			return { ok: true, already: true, body: JSON.stringify(json), added: 0 };
+		}
+		json.providers = json.providers.filter((p) => p !== existing);
+	}
 	const tpl = json.providers.find((p) => p && Array.isArray(p.types) && p.types.length);
 	const ours = buildProvider(tpl);
-	const existing = json.providers.find((p) => p && p.key === 'custom');
-	if (existing) json.providers = json.providers.filter((p) => p !== existing);
 	json.providers.push(ours);
 	return { ok: true, body: JSON.stringify(json), added: state.models.length };
 }
@@ -412,15 +522,15 @@ function forwardUpstream(req, res, bodyChunks) {
 		{ host, port: 443, method: req.method, path: req.url, headers, servername: host },
 		(upRes) => {
 			res.writeHead(upRes.statusCode || 502, upRes.headers);
-			/* 临时诊断（用完删除）：dump agent_chat_generation 响应抓网关错误详情 */
-			if (/agent_chat_generation/.test(req.url || '')) {
+			/* 诊断 dump（默认关闭，CCB_QODER_DEBUG=1 才启用；含明文密钥必须脱敏） */
+			if (debugDumpEnabled() && /agent_chat_generation/.test(req.url || '')) {
 				let buf = '';
 				const keep = (c) => { buf += c.toString('utf8'); };
 				upRes.on('data', keep);
 				upRes.on('end', () => {
 					try {
 						fs.appendFileSync(path.join(state.dataDir, 'qoder-agentchat-dump.txt'),
-							`\n===== ${new Date().toISOString()} ${req.method} ${req.url}\nstatus=${upRes.statusCode}\n${buf.slice(0, 6000)}\n`);
+							redactSecrets(`\n===== ${new Date().toISOString()} ${req.method} ${req.url}\nstatus=${upRes.statusCode}\n${buf.slice(0, 6000)}\n`));
 					} catch {}
 				});
 			}
@@ -536,12 +646,17 @@ function handleRequest(req, res, bodyChunks) {
 	const reqHost = String(req.headers.host || '').toLowerCase();
 	if (req.method === 'POST' && bodyChunks && bodyChunks.length) {
 		const head = Buffer.concat(bodyChunks.slice(0, 8)).toString('latin1');
-		if (head.includes('sk-ccb-')) {
+		if (head.includes('sk-ccb-') && debugDumpEnabled()) {
 			log('发现请求体携带 CCB 密钥但未走 Bearer 头，已 dump（待适配）');
 			try {
+				/* 最多保留最新 10 个 keyed-req dump：含请求体的诊断文件，防无限堆积 */
+				const olds = fs.readdirSync(state.dataDir).filter((f) => /^qoder-keyed-req-\d+\.txt$/.test(f)).sort();
+				while (olds.length >= 10) {
+					try { fs.rmSync(path.join(state.dataDir, olds.shift())); } catch { break; }
+				}
 				fs.writeFileSync(path.join(state.dataDir, `qoder-keyed-req-${Date.now()}.txt`),
-					`POST https://${req.headers.host}${req.url}\nheaders: ${JSON.stringify(req.headers, null, 2)}\n\n` +
-					Buffer.concat(bodyChunks).toString('utf8').slice(0, 200000));
+					redactSecrets(`POST https://${req.headers.host}${req.url}\nheaders: ${JSON.stringify(req.headers, null, 2)}\n\n` +
+					Buffer.concat(bodyChunks).toString('utf8').slice(0, 200000)));
 			} catch {}
 		}
 		/* 模型名侦测：请求体精确出现 "model":"<我们的模型名>" 时记录（判定推理走向） */
@@ -561,11 +676,13 @@ function handleRequest(req, res, bodyChunks) {
 		fetchUpstream(req, bodyChunks, (err, upRes, body) => {
 			if (err) { res.destroy(); return; }
 			let out = body;
-			/* 排障：落盘最新的 user/status|plan 原始响应，确认 allow_byok 字段位置 */
-			try {
-				fs.writeFileSync(path.join(state.dataDir, 'qoder-user-resp-dump.txt'),
-					`${req.method} ${req.url}\nHTTP ${upRes.statusCode}\n\n${body.toString('utf8').slice(0, 8000)}`);
-			} catch {}
+			/* 排障 dump（默认关闭，CCB_QODER_DEBUG=1 启用；脱敏后落盘） */
+			if (debugDumpEnabled()) {
+				try {
+					fs.writeFileSync(path.join(state.dataDir, 'qoder-user-resp-dump.txt'),
+						redactSecrets(`${req.method} ${req.url}\nHTTP ${upRes.statusCode}\n\n${body.toString('utf8').slice(0, 8000)}`));
+				} catch {}
+			}
 			try {
 				const j = JSON.parse(body.toString('utf8'));
 				let changed = false;
@@ -599,12 +716,12 @@ function handleRequest(req, res, bodyChunks) {
 				return;
 			}
 			const text = body.toString('utf8');
-			/* dump 原始响应（首次）供排障 */
-			if (!state.dumpDone) {
+			/* dump 原始响应（首次）供排障：默认关闭，CCB_QODER_DEBUG=1 启用 */
+			if (!state.dumpDone && debugDumpEnabled()) {
 				state.dumpDone = true;
 				try {
 					fs.writeFileSync(path.join(state.dataDir, 'qoder-byok-dump.json'),
-						`HTTP ${upRes.statusCode}\nheaders: ${JSON.stringify(upRes.headers, null, 2)}\n\n${text}`);
+						redactSecrets(`HTTP ${upRes.statusCode}\nheaders: ${JSON.stringify(upRes.headers, null, 2)}\n\n${text}`));
 					log(`已 dump 原始 BYOK 配置到 ${path.join(state.dataDir, 'qoder-byok-dump.json')}`);
 				} catch {}
 			}
@@ -646,10 +763,13 @@ function handleRequest(req, res, bodyChunks) {
 	if (/\/api\/v3\/user\/login/.test(req.url || '') || /\/api\/v2\/service\/migration\/identity/.test(req.url || '')) {
 		fetchUpstream(req, bodyChunks, (err, upRes, body) => {
 			if (err) { res.destroy(); return; }
-			try {
-				fs.writeFileSync(path.join(state.dataDir, 'qoder-login-dump.txt'),
-					`${req.method} ${req.url}\nHTTP ${upRes.statusCode}\n\n${body.toString('utf8').slice(0, 8000)}`);
-			} catch {}
+			/* 排障 dump（默认关闭，CCB_QODER_DEBUG=1 启用；脱敏后落盘） */
+			if (debugDumpEnabled()) {
+				try {
+					fs.writeFileSync(path.join(state.dataDir, 'qoder-login-dump.txt'),
+						redactSecrets(`${req.method} ${req.url}\nHTTP ${upRes.statusCode}\n\n${body.toString('utf8').slice(0, 8000)}`));
+				} catch {}
+			}
 			const headers = { ...upRes.headers };
 			delete headers['content-encoding'];
 			delete headers['content-length'];
@@ -669,16 +789,34 @@ function handleRequest(req, res, bodyChunks) {
 function handlePlainRequest() {
 	return (req, res) => {
 		const chunks = [];
-		req.on('data', (c) => chunks.push(c));
-		req.on('end', () => handleRequest(req, res, chunks));
+		let size = 0;
+		let rejected = false;
+		req.on('data', (c) => {
+			if (rejected) return;
+			size += c.length;
+			/* 请求体全量缓冲无上限会被大 body 打爆内存：10MB 封顶，超出 413 + 销毁 */
+			if (size > 10 * 1024 * 1024) {
+				rejected = true;
+				try {
+					res.writeHead(413, { 'Content-Type': 'text/plain; charset=utf-8' });
+					res.end('CCB proxy: request body too large');
+				} catch {}
+				req.destroy();
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on('end', () => { if (!rejected) handleRequest(req, res, chunks); });
 		req.on('error', () => res.destroy());
 	};
 }
 
-function mitmSocket(clientSocket, host, port) {
+function mitmSocket(clientSocket, host, port, onFirstByte) {
 	const { key, cert } = siteCert(host);
 	const ctx = tls.createSecureContext({ key, cert });
 	const secure = new tls.TLSSocket(clientSocket, { isServer: true, secureContext: ctx });
+	/* 握手后首个应用数据到达即回调（解除 CONNECT 空挂超时） */
+	if (onFirstByte) secure.once('data', onFirstByte);
 	secure.on('error', (e) => {
 		log(`TLS 终结失败 ${host}：${e.message}`);
 		clientSocket.destroy();
@@ -689,14 +827,24 @@ function mitmSocket(clientSocket, host, port) {
 	srv.emit('connection', secure);
 }
 
-function tunnel(clientSocket, host, port) {
+function tunnel(clientSocket, host, port, rest) {
 	state.stats.tunneled++;
 	log(`隧道透传：${host}:${port || 443}`);
 	const upstream = net.connect(port || 443, host, () => {
 		clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+		/* 首包残余字节（CONNECT 头之后同包携带的 TLS ClientHello 等）补发上游，
+		 * 否则上游干等、客户端也在等握手响应，双向挂死 */
+		if (rest && rest.length) upstream.write(rest);
 		upstream.pipe(clientSocket);
 		clientSocket.pipe(upstream);
 	});
+	/* 空挂保护：隧道建立后客户端 30s 不发首字节即销毁（收到首字节解除） */
+	const idle = setTimeout(() => {
+		log(`隧道 30s 未收到客户端首字节，销毁空挂 socket：${host}:${port || 443}`);
+		clientSocket.destroy();
+		upstream.destroy();
+	}, 30000);
+	clientSocket.once('data', () => clearTimeout(idle));
 	upstream.on('error', () => clientSocket.destroy());
 	clientSocket.on('error', () => upstream.destroy());
 }
@@ -716,11 +864,21 @@ function onProxyConnection(socket) {
 		if (m) {
 			const host = m[1];
 			const port = Number(m[2]) || 443;
+			/* 首包可能不止请求行：CONNECT 头（\r\n\r\n）之后可能同包携带 TLS ClientHello，
+			 * 只消费头部、剩余字节必须回填/转发，否则握手双方互等、连接挂死 */
+			const he = head.indexOf('\r\n\r\n');
+			const rest = he === -1 ? Buffer.alloc(0) : head.slice(he + 4);
 			if (shouldMitm(host)) {
 				socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-				mitmSocket(socket, host, port);
+				if (rest.length) socket.unshift(rest);
+				/* 对端迟迟不发 TLS 首字节的空挂连接 30s 超时销毁（收到首字节解除） */
+				const idle = setTimeout(() => {
+					log(`MITM 连接 30s 未收到首字节，销毁空挂 socket：${host}（${peer}）`);
+					socket.destroy();
+				}, 30000);
+				mitmSocket(socket, host, port, () => clearTimeout(idle));
 			} else {
-				tunnel(socket, host, port);
+				tunnel(socket, host, port, rest);
 			}
 			return;
 		}
@@ -741,7 +899,7 @@ function start(opts = {}) {
 	}
 	if (opts.log) state.log = opts.log;
 	if (opts.dataDir) state.dataDir = opts.dataDir;
-	if (opts.relayBaseUrl) state.relayBaseUrl = String(opts.relayBaseUrl);
+	if (opts.relayBaseUrl) setRelayBaseUrl(String(opts.relayBaseUrl));
 	state.port = opts.port || DEFAULT_PORT;
 	ensureCa();
 	if (opts.models) setModels(opts.models);
@@ -780,7 +938,7 @@ function status() {
 function init(opts = {}) {
 	if (opts.dataDir) state.dataDir = opts.dataDir;
 	if (opts.log) state.log = opts.log;
-	if (opts.relayBaseUrl) state.relayBaseUrl = String(opts.relayBaseUrl);
+	if (opts.relayBaseUrl) setRelayBaseUrl(String(opts.relayBaseUrl));
 }
 
 module.exports = {
@@ -795,6 +953,7 @@ module.exports = {
 	buildProvider,
 	setModels,
 	setRelayBaseUrl,
+	normalizeRelayBaseUrl,
 	DEFAULT_PORT,
 	RELAY_BASE_URL,
 };

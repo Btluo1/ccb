@@ -570,6 +570,18 @@ async function applyAll() {
 	btn.innerHTML = '正在自动配置…';
 
 	try {
+		await applyAllInner();
+	} catch (e) {
+		/* IPC 异常（主进程处理抛错、窗口重载等）必须有可见反馈——
+		 * 否则只有 finally 恢复按钮，用户看到「没反应」，无从排查 */
+		toast('配置过程出错：' + ((e && e.message) || e || '未知错误'));
+	} finally {
+		btn.disabled = false;
+		btn.innerHTML = BTN_HTML;
+	}
+}
+
+async function applyAllInner() {
 		/* 1. 校验登录态并刷新余额 */
 		const p = await window.ccb.api.profile();
 		if (p.error || !p.user) {
@@ -667,10 +679,6 @@ async function applyAll() {
 		toast(`${doneNames.join('、')} 已配置并启动，即可直接使用`);
 	}
 	$('#allSummary').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-	} finally {
-		btn.disabled = false;
-		btn.innerHTML = BTN_HTML;
-	}
 }
 
 /* ================= 使用前提 / 后续步骤 =================
@@ -1127,29 +1135,36 @@ function renderPanel() {
 async function applyOne(c) {
 	const btn = $('#applyBtn');
 	if (btn) { btn.disabled = true; btn.textContent = '正在写入…'; }
-	await ensureKey(c.provider);
-	const k = clientKey(c) || {};
-	const r = await window.ccb.applyConfig(c.id, {
-		apiKey: k.apiKey || '',
-		apiBase: clientApiBase(c),
-		anthropicBase: state.keys['anthropic'] ? (state.keys['anthropic'].baseUrl || state.anthropicBase) : state.anthropicBase,
-		models: clientModelIds(c),
-		defaultModel: state.defaultModel,
-		cursorMitm: c.id === 'cursor' ? { enabled: state.cursorMode === 'mitm' } : undefined,
-	});
-	const text = (r.log || []).concat(r.ok ? [] : [r.error || '写入失败']).join('\n');
-	state.lastLog[c.id] = { ok: !!r.ok, text };
-	state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: (state.results[c.id] || {}).launch || null };
-	renderClients();
-	renderPanel();
-	showSummary([c]);
-	const needLogin = clientLoginReq(c) && (r.ok === false ? /未登录/.test(r.error || '') : !!r.warning);
-	if (needLogin) {
-		toast(`${c.name} 还差一步：先在客户端登录，再回来重新配置`);
-	} else if (r.ok && r.warning) {
-		toast(`${c.name} 配置已写入，需在模型选择器里选一次 CCB 模型`);
-	} else {
-		toast(r.ok ? `${c.name} 配置已写入` : '写入失败，请查看日志');
+	try {
+		await ensureKey(c.provider);
+		const k = clientKey(c) || {};
+		const r = await window.ccb.applyConfig(c.id, {
+			apiKey: k.apiKey || '',
+			apiBase: clientApiBase(c),
+			anthropicBase: state.keys['anthropic'] ? (state.keys['anthropic'].baseUrl || state.anthropicBase) : state.anthropicBase,
+			models: clientModelIds(c),
+			defaultModel: state.defaultModel,
+			cursorMitm: c.id === 'cursor' ? { enabled: state.cursorMode === 'mitm' } : undefined,
+		});
+		const text = (r.log || []).concat(r.ok ? [] : [r.error || '写入失败']).join('\n');
+		state.lastLog[c.id] = { ok: !!r.ok, text };
+		state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: (state.results[c.id] || {}).launch || null };
+		renderClients();
+		renderPanel();
+		showSummary([c]);
+		const needLogin = clientLoginReq(c) && (r.ok === false ? /未登录/.test(r.error || '') : !!r.warning);
+		if (needLogin) {
+			toast(`${c.name} 还差一步：先在客户端登录，再回来重新配置`);
+		} else if (r.ok && r.warning) {
+			toast(`${c.name} 配置已写入，需在模型选择器里选一次 CCB 模型`);
+		} else {
+			toast(r.ok ? `${c.name} 配置已写入` : '写入失败，请查看日志');
+		}
+	} catch (e) {
+		/* IPC 异常必须有可见反馈，且不能留下永远 disabled 的按钮 */
+		toast('配置过程出错：' + ((e && e.message) || e || '未知错误'));
+	} finally {
+		if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '重新写入配置'; }
 	}
 }
 

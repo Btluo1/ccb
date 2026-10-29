@@ -39,7 +39,8 @@
  *   - 界面结构由 Trae 版本决定，选择器全部集中在下面 SEL 常量里，便于版本变更时修
  */
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const { isRunning } = require('./proc');
@@ -57,9 +58,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * .add-model-connect-button 与四个表单占位符（indexOf 前缀匹配）在新版均原样保留
  * （新版的「完整 URL」复选框默认不勾，行为与旧版一致：客户端自动拼 /chat/completions）。 */
 const SEL = {
-	modelTrigger: '.core-model-select-trigger, .icd-model-select-trigger',
-	modelMenu: '.core-model-select-portal, .icube-model-select-portal',
-	menuFooterAdd: '.core-model-select-footer-action, .icube-model-select-portal-footer',
+	/* 末尾的 [class*=...] 通配是前缀再次改名时的兜底（3.4.4 实测选择器沿用旧代） */
+	modelTrigger: '.core-model-select-trigger, .icd-model-select-trigger, [class*="model-select-trigger"]',
+	modelMenu: '.core-model-select-portal, .icube-model-select-portal, [class*="model-select-portal"]',
+	menuFooterAdd: '.core-model-select-footer-action, .icube-model-select-portal-footer, [class*="model-select"][class*="footer"]',
 	settingsTable: 'table.icd-accordion-table',
 	dialog: '.icd-modal-overlay.add-model-dialog',
 	dialogSubmit: '.add-model-connect-button',
@@ -100,26 +102,50 @@ async function killRunning(exeNames, log) {
 		return !names.some((n) => isRunning(n));
 	};
 
-	/* 先礼貌关闭（给客户端保存状态的机会），超时再强制结束 */
-	for (const n of names) spawn('taskkill', ['/IM', n], { stdio: 'ignore', windowsHide: true });
+	/* 先礼貌关闭（给客户端保存状态的机会），超时再强制结束。
+	 * 用 spawnSync 保证 taskkill 真正执行完再进轮询（异步 spawn 不保证时序，可能
+	 * 进程还没杀就开始等退出）；/T 连整棵进程树一起结束——客户端的守护/子进程
+	 * 映像名与本体外壳不同，不带 /T 会漏杀，残留的子进程照样占着单实例锁 */
+	for (const n of names) spawnSync('taskkill', ['/IM', '/T', n], { stdio: 'ignore', windowsHide: true });
 	if (await waitGone(12000)) {
 		await sleep(1200);
 		return true;
 	}
-	for (const n of names) spawn('taskkill', ['/F', '/IM', n], { stdio: 'ignore', windowsHide: true });
+	for (const n of names) spawnSync('taskkill', ['/F', '/IM', '/T', n], { stdio: 'ignore', windowsHide: true });
 	const gone = await waitGone(12000);
 	await sleep(1500);
 	return gone;
 }
 
 function launchWithDebugPort(exePath, port) {
+	/* spawn 前先校验路径：exe 不存在时 spawn 会异步触发 error 事件，没有监听者
+	 * 会作为未捕获异常击穿 Electron 主进程 */
+	if (!fs.existsSync(exePath)) throw new Error(`未找到程序位置：${exePath}`);
 	const child = spawn(exePath, [`--remote-debugging-port=${port}`], {
 		detached: true,
 		stdio: 'ignore',
 		cwd: path.dirname(exePath),
 		env: process.env,
 	});
+	/* 启动失败（权限、杀软拦截等）只记日志：客户端拉不起来时后续 Cdp.connect
+	 * 会以可读的超时错误收尾，这里绝不能让 error 事件无人监听而击穿主进程 */
+	child.on('error', (e) => console.error(`[traeui] 客户端启动失败：${e.message || e}`));
 	child.unref();
+}
+
+/** 探测调试端口状态：'cdp' 端点正常应答 / 'occupied' 被别的进程抢占 / 'free' 没有监听者 */
+async function probeDebugPort(port) {
+	try {
+		await Cdp.listPages(port);
+		return 'cdp';
+	} catch {}
+	const listening = await new Promise((resolve) => {
+		const sock = net.connect({ host: '127.0.0.1', port });
+		sock.once('connect', () => { sock.destroy(); resolve(true); });
+		sock.once('error', () => resolve(false));
+		sock.setTimeout(1500, () => { sock.destroy(); resolve(false); });
+	});
+	return listening ? 'occupied' : 'free';
 }
 
 /* ---------- CDP ---------- */
@@ -139,8 +165,15 @@ class Cdp {
 			const p = msg.id && this.pending.get(msg.id);
 			if (p) {
 				this.pending.delete(msg.id);
-				p(msg);
+				p.resolve(msg);
 			}
+		});
+		/* 连接断开时在飞的请求永远等不到应答：立刻全部 reject，
+		 * 否则会各自干烧到超时（最长 90 秒）才报错 */
+		ws.addEventListener('close', () => {
+			const err = new Error('调试通道已断开');
+			for (const p of this.pending.values()) p.reject(err);
+			this.pending.clear();
 		});
 	}
 
@@ -158,8 +191,14 @@ class Cdp {
 			setTimeout(() => reject(new Error('调试通道连接超时')), 8000);
 		});
 		const cdp = new Cdp(ws);
-		await cdp.send('Runtime.enable', {});
-		await cdp.send('Page.enable', {});
+		try {
+			await cdp.send('Runtime.enable', {});
+			await cdp.send('Page.enable', {});
+		} catch (e) {
+			/* 握手失败的 socket 不能留（没人会再关它）：先关闭再抛 */
+			try { ws.close(); } catch {}
+			throw e;
+		}
 		return cdp;
 	}
 
@@ -183,7 +222,7 @@ class Cdp {
 	send(method, params, timeoutMs = 20000) {
 		return new Promise((resolve, reject) => {
 			const id = ++this.seq;
-			this.pending.set(id, resolve);
+			this.pending.set(id, { resolve, reject });
 			this.ws.send(JSON.stringify({ id, method, params: params || {} }));
 			setTimeout(() => {
 				if (this.pending.delete(id)) reject(new Error(`CDP ${method} 超时`));
@@ -426,18 +465,41 @@ async function waitForWorkbench(cdp, port, label, log, opts = {}) {
 	const notLoggedIn = () => ({ cdp, error: `${label} 未登录，请先登录后重新配置` });
 	const pool = new Map(); /* webSocketDebuggerUrl -> Cdp */
 	if (cdp && cdp.ws.readyState === 1) pool.set(cdp.ws.url, cdp);
+	/* 池级清理：目标池里没被最终选中的连接（含已 Runtime.enable/Page.enable 的）
+	 * 必须全部关掉——否则每轮探测都会泄漏一批挂着 enable 的调试 socket
+	 * （调用方 finally 只关返回的那条，管不到池里其余连接） */
+	const closePool = (keep) => {
+		for (const [url, c] of pool) {
+			if (c === keep) continue;
+			try { if (c && typeof c.close === 'function') c.close(); } catch {}
+			pool.delete(url);
+		}
+	};
 	const deadline = Date.now() + deadlineMs;
 	let loginSince = 0;
+	/* 诊断信息：超时时随错误文案带出去，远程排障不用再要日志（2026-10-22 用户
+	 * 报「主界面等待超时」，仅靠旧文案无法区分「客户端根本没起来」与「起来了但
+	 * 停在别的界面」两种完全不同的根因） */
+	const seenWindows = new Set(); /* 短名：url 尾段或标题 */
+	let sawLogin = false;
+	const shortName = (p) => {
+		try {
+			const u = decodeURIComponent(p.url || '');
+			const tail = u.split('/').pop().split('?')[0];
+			return tail || p.title || u.slice(0, 60);
+		} catch { return p.title || String(p.url || '').slice(0, 60); }
+	};
 	for (;;) {
 		/* 目标列表随窗口开合变化（splash 关掉、浮窗常驻、主窗口出现），每轮重拉；
 		 * 端口暂时不可用时保留现有池继续探测，不算失败 */
 		let pages = [];
 		try { pages = await Cdp.listPages(port); } catch {}
 		for (const p of pages) {
+			seenWindows.add(shortName(p));
 			if (!pool.has(p.webSocketDebuggerUrl)) {
 				try {
 					pool.set(p.webSocketDebuggerUrl, await Cdp.open(p.webSocketDebuggerUrl));
-					log('发现新的客户端窗口，纳入探测…');
+					log(`发现新的客户端窗口（${shortName(p)}），纳入探测…`);
 				} catch {}
 			}
 		}
@@ -446,15 +508,20 @@ async function waitForWorkbench(cdp, port, label, log, opts = {}) {
 			if (c.ws.readyState !== 1) { pool.delete(url); continue; }
 			let triggered = false;
 			try { triggered = !!(await c.evaluate(RECT_TRIGGER)); } catch {}
-			if (triggered) return { cdp: c };
+			if (triggered) {
+				closePool(c); /* 选中一条，其余全部关闭 */
+				return { cdp: c };
+			}
 			try { if (await c.evaluate(LOGIN_VISIBLE)) login = true; } catch {}
 		}
 		if (login) {
+			sawLogin = true;
 			if (!loginSince) {
 				loginSince = Date.now();
 				log(`看到「登录」按钮，先等 ${label} 恢复登录会话（冷启动时顶栏会短暂显示登录态）…`);
 			} else if (Date.now() - loginSince >= loginGraceMs) {
 				log(`「登录」按钮持续 ${Math.round(loginGraceMs / 1000)} 秒未消失，判定 ${label} 未登录。`);
+				closePool(cdp);
 				return notLoggedIn();
 			}
 		} else {
@@ -462,7 +529,13 @@ async function waitForWorkbench(cdp, port, label, log, opts = {}) {
 			loginSince = 0;
 		}
 		if (Date.now() >= deadline) {
-			return loginSince ? notLoggedIn() : { cdp, error: `${label} 主界面等待超时：模型选择器一直没出现，请确认客户端窗口已打开后重试` };
+			closePool(cdp);
+			if (loginSince) return notLoggedIn();
+			if (!seenWindows.size) {
+				return { cdp, error: `${label} 主界面等待超时：没有发现任何客户端调试窗口，客户端可能未成功启动，请完全退出 ${label} 后重试` };
+			}
+			const wins = [...seenWindows].slice(0, 4).join('、');
+			return { cdp, error: `${label} 主界面等待超时：模型选择器一直没出现（已发现窗口：${wins}${sawLogin ? '；期间出现过登录入口' : ''}），请在客户端里打开 AI 对话主界面后重试` };
 		}
 		await sleep(pollMs);
 	}
@@ -602,8 +675,10 @@ async function selectModel(cdp, displayName, log) {
 	/* 刚通过 RPC 添加的模型要等服务端目录刷新后才会出现在菜单里，轮询至多 60 秒
 	 * （整批添加后目录同步明显变慢，30 秒不够——Trae 国际版实测 7 个模型加完
 	 * 后 30 秒内菜单一条 CCB 都没有） */
-	const deadline = Date.now() + 60000;
 	for (let attempt = 0; attempt < 3; attempt++) {
+		/* deadline 必须每次重试重新计：放在循环外的话，前一次失败消耗的时间会吃掉
+		 * 后几次的窗口（目录同步慢时，后两次重试等于直接放弃） */
+		const deadline = Date.now() + 60000;
 		/* 模型全部添加完成后，任何一步失败都不该把整个配置判为失败：
 		 * 选择器瞬时缺席（设置页关闭后的重渲染）只降级为「请手动选一次」 */
 		let trig = null;
@@ -611,7 +686,7 @@ async function selectModel(cdp, displayName, log) {
 			trig = await waitForRect(cdp, RECT_TRIGGER, 15000, '模型选择器');
 		} catch {}
 		if (!trig) {
-			log('模型选择器暂时不可见，跳过默认模型切换。');
+			log('模型选择器暂时不可见，跳过默认模型切换。若客户端近期更新过版本，当前客户端版本可能与 CCB 不兼容，请更新 CCB 后重试。');
 			return false;
 		}
 		const t = JSON.parse(trig);
@@ -631,7 +706,7 @@ async function selectModel(cdp, displayName, log) {
 		}
 		if (!item) {
 			if (Date.now() < deadline) continue;
-			log(`模型菜单里暂时没看到 ${displayName}，跳过默认模型切换。`);
+			log(`模型菜单里暂时没看到 ${displayName}，跳过默认模型切换。若客户端近期更新过版本，当前客户端版本可能与 CCB 不兼容，请更新 CCB 后重试。`);
 			await cdp.pressEscape();
 			return false;
 		}
@@ -648,7 +723,7 @@ async function selectModel(cdp, displayName, log) {
 		await cdp.pressEscape();
 		await sleep(500);
 	}
-	log(`未能自动切换到 ${displayName}，请在模型列表里手动选一次。`);
+	log(`未能自动切换到 ${displayName}，请在模型列表里手动选一次。若客户端近期更新过版本，当前客户端版本可能与 CCB 不兼容，请更新 CCB 后重试。`);
 	return false;
 }
 
@@ -881,18 +956,32 @@ async function addModelsViaRpc(cdp, cfg, log, opts = {}) {
  * @param {boolean} [opts.rpc]   置 false 可强制走 UI 点击路径（默认 RPC 优先）
  */
 async function addCustomModels({ exePath, exeNames, label, cfg, log, rpcOpts, rpc }) {
-	const port = await findFreePort();
-
 	if (!(await killRunning(exeNames, log))) {
 		return { ok: false, error: `请先完全退出 ${label} 后重试` };
 	}
 
-	log(`正在以调试模式启动 ${label} …`);
-	launchWithDebugPort(exePath, port);
-
+	/* 端口竞态兜底（最多重试 1 次）：findFreePort 释放端口到客户端绑定之间有一个窗口，
+	 * 端口可能被别的进程抢走（或客户端因单实例激活旧窗口而没开出调试口），旧逻辑会对
+	 * 一个非 CDP 端口空等满 120 秒。connect 失败后先确认端口状态，确属异常则把刚拉起的
+	 * 实例彻底杀掉等退出，再换新端口拉一次。 */
 	let cdp = null;
+	let port = 0;
+	for (let attempt = 0; attempt < 2 && !cdp; attempt++) {
+		port = await findFreePort();
+		if (attempt) log('换个调试端口再试一次…');
+		log(`正在以调试模式启动 ${label} …`);
+		launchWithDebugPort(exePath, port);
+		try {
+			cdp = await Cdp.connect(port, 120000);
+		} catch (e) {
+			const state = await probeDebugPort(port);
+			if (attempt === 1 || state === 'cdp') throw e;
+			log(`调试端口${state === 'occupied' ? '疑似被其他进程抢占' : '未由客户端开出'}，彻底关闭刚拉起的实例后重试…`);
+			if (!(await killRunning(exeNames, log))) throw e; /* 清理不干净不重试，避免叠加实例 */
+		}
+	}
+
 	try {
-		cdp = await Cdp.connect(port, 120000);
 		const wb = await waitForWorkbench(cdp, port, label, log);
 		cdp = wb.cdp; /* 等待期间可能已改连别的窗口，后续步骤要用新的连接 */
 		if (wb.error) {
@@ -975,4 +1064,4 @@ async function addCustomModels({ exePath, exeNames, label, cfg, log, rpcOpts, rp
 /** 展示名加 CCB 前缀：Trae 的模型列表里混着同名预置模型，不区分会看不懂 */
 const displayNameOf = (modelId) => `CCB ${modelId}`;
 
-module.exports = { addCustomModels, displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, LOGIN_VISIBLE, ENSURE_APPEND_MODE, openModelSettings, readExisting, addOne, selectModel, RPC_FIND_SERVICE, RPC_LIST, buildRpcPayload, isRpcAddSuccess, rpcWaitModelList, rpcAddOne, addModelsViaRpc };
+module.exports = { addCustomModels, displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, RECT_TRIGGER, LOGIN_VISIBLE, ENSURE_APPEND_MODE, openModelSettings, readExisting, addOne, selectModel, RPC_FIND_SERVICE, RPC_LIST, buildRpcPayload, isRpcAddSuccess, rpcWaitModelList, rpcAddOne, addModelsViaRpc };

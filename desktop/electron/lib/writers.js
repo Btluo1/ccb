@@ -33,8 +33,19 @@ function readText(file) {
 	return fs.readFileSync(file, 'utf8');
 }
 
+/* 原子写入：先写同目录临时文件再 rename。直接覆盖写时进程崩溃/断电会留下
+ * 截断的配置文件（models.json、settings.json、config.toml 都是解析失败即影响
+ * 客户端启动的关键文件）；rename 在同卷下是原子的，要么旧文件要么新文件。 */
 function writeText(file, content) {
-	fs.writeFileSync(file, content, { encoding: 'utf8' });
+	const tmp = file + '.ccb-tmp';
+	fs.writeFileSync(tmp, content, { encoding: 'utf8' });
+	try {
+		fs.renameSync(tmp, file);
+	} catch (e) {
+		/* 极少数环境 rename 跨设备/被占用失败：清掉临时文件后回退直接写 */
+		try { fs.rmSync(tmp, { force: true }); } catch {}
+		fs.writeFileSync(file, content, { encoding: 'utf8' });
+	}
 }
 
 function backup(file, log) {
@@ -235,15 +246,23 @@ async function writeWorkBuddy(cfg, log, client, detected) {
 	}
 
 	const extraUids = [...new Set(dirs.flatMap((d) => accountUidsUnder(d)))];
-	const r = await selectWorkBuddyModel({ exePath: exe, modelId: model, label: client.name, log, extraUids });
-	if (r.entries && r.entries.length) saveGuiChoice(dirs, GUI_SNAPSHOT_FILES.workbuddy, r.entries, log);
-
 	/* selectDefaultModel 为了写 localStorage 会把客户端以「调试端口」方式拉起来。调试端口开着时
-	 * 本机任何进程都能接入并读取客户端内的凭据，所以注入完立刻关掉：一键配置随后会正常
-	 * 重新启动它，单点「重新写入配置」也不会在用户机器上留一个带调试端口的实例。
-	 * 等待一小会儿是为了让 Chromium 把 localStorage 落盘（实测硬杀后仍存活，这里只是留余量）。 */
-	await sleep(800);
-	await stopClient(client);
+	 * 本机任何进程都能接入并读取客户端内的凭据，所以无论成功、失败还是中途抛异常都必须立刻
+	 * 关掉（try/finally）：一键配置随后会正常重新启动它，单点「重新写入配置」也不会在用户
+	 * 机器上留一个带调试端口的实例。等待一小会儿是给 Chromium 落盘 localStorage 留余量。 */
+	let r;
+	try {
+		r = await selectWorkBuddyModel({ exePath: exe, modelId: model, label: client.name, log, extraUids });
+		if (r.entries && r.entries.length) saveGuiChoice(dirs, GUI_SNAPSHOT_FILES.workbuddy, r.entries, log);
+	} finally {
+		await sleep(800);
+		const stop = await stopClient(client);
+		if (!stop.stopped) {
+			/* 常规关闭失败再补一次强杀：调试端口绝不留存 */
+			log('警告：客户端未能自动退出，正在强制结束以关闭调试端口…');
+			await stopClient(client);
+		}
+	}
 
 	if (!r.ok) {
 		/* 模型列表已经写好了，只是界面默认模型没设上（多数是还没登录，取不到账号 uid），
@@ -377,9 +396,14 @@ async function writeTraeUi(cfg, log, client, detected) {
 	} finally {
 		/* addCustomModels 会带调试端口拉起客户端；调试端口开着时本机任何进程都能接入
 		 * 并读取客户端内的凭据，所以和 WorkBuddy / ZCode 一样，流程结束（无论成败）立刻
-		 * 关掉，用户点「启动 / 重启」再正常打开。稍等片刻是给客户端留落盘时间。 */
+		 * 关掉，用户点「启动 / 重启」再正常打开。稍等片刻是给客户端留落盘时间。
+		 * 关闭失败必须再补一次强杀：调试端口绝不留存。 */
 		await sleep(800);
-		await stopClient(client);
+		const stop = await stopClient(client);
+		if (!stop.stopped) {
+			log('警告：客户端未能自动退出，正在强制结束以关闭调试端口…');
+			await stopClient(client);
+		}
 	}
 }
 
@@ -458,6 +482,55 @@ function cursorSettingsPath(appDataDir) {
 	return path.join(appDataDir, 'User', 'settings.json');
 }
 
+/* ---------- 代理设置归属标记 ----------
+ * 回滚代理三件套时按「值像 127.0.0.1 代理」删除有个漏洞：用户在 CCB 写入之后
+ * 自己又在客户端里配了本机代理（如 Clash 127.0.0.1:7890），无 .bak 时回滚会把
+ * 用户自己的代理删掉。因此写入时把「我们写进哪个文件、写了什么 URL」记到
+ * ~/.ccb/proxy-owners.json，回滚只删与记录一致的值；无记录时才退回默认端口匹配。 */
+const PROXY_OWNER_FILES = {
+	cursor: 'cursor',
+	qoder: 'qoder',
+};
+const PROXY_OWNERS_PATH = () => path.join(HOME, '.ccb', 'proxy-owners.json');
+
+function readProxyOwners() {
+	try {
+		const d = JSON.parse(fs.readFileSync(PROXY_OWNERS_PATH(), 'utf8'));
+		return d && typeof d === 'object' && !Array.isArray(d) ? d : {};
+	} catch {
+		return {};
+	}
+}
+
+function markProxyOwnership(kind, settingsFile, proxyUrl) {
+	try {
+		const owners = readProxyOwners();
+		if (!owners[kind] || typeof owners[kind] !== 'object') owners[kind] = {};
+		owners[kind][settingsFile] = proxyUrl;
+		fs.mkdirSync(path.dirname(PROXY_OWNERS_PATH()), { recursive: true });
+		writeText(PROXY_OWNERS_PATH(), JSON.stringify(owners, null, 2));
+	} catch { /* 标记失败只弱化回滚精度，不影响写入 */ }
+}
+
+function unmarkProxyOwnership(kind, settingsFile) {
+	try {
+		const owners = readProxyOwners();
+		if (owners[kind] && owners[kind][settingsFile]) {
+			delete owners[kind][settingsFile];
+			writeText(PROXY_OWNERS_PATH(), JSON.stringify(owners, null, 2));
+		}
+	} catch {}
+}
+
+/** 判断 settings 里的代理 URL 是否「归我们所有」（可安全删除）。
+ *  有归属记录按记录判定；无记录（老版本写入的）只认我们的默认端口，不再宽匹配任意端口。 */
+function proxyUrlOwnedByUs(kind, settingsFile, url, defaultPort) {
+	const owners = readProxyOwners();
+	const rec = owners[kind] && owners[kind][settingsFile];
+	if (rec) return url === rec;
+	return url === `http://127.0.0.1:${defaultPort}`;
+}
+
 /** 写入代理三件套；返回是否有改动 */
 function writeCursorProxySettings(appDataDir, port, log) {
 	const file = cursorSettingsPath(appDataDir);
@@ -490,15 +563,20 @@ function writeCursorProxySettings(appDataDir, port, log) {
 	Object.assign(settings, want);
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	writeText(file, JSON.stringify(settings, null, '\t') + '\n');
+	markProxyOwnership(PROXY_OWNER_FILES.cursor, file, proxyUrl);
 	log(`已写入 Cursor 代理配置（${proxyUrl}，override，禁用 HTTP/2）`);
 	return true;
 }
 
-/** 回滚代理三件套：优先整体恢复 .bak，否则只摘除值与我们一致的三键 */
+/** 回滚代理三件套：优先整体恢复 .bak，否则只摘除「确认归我们所有」的键。
+ *  用户在 CCB 写入后自己配的同形态代理（127.0.0.1 其它端口）不得误删。 */
 function rollbackCursorProxySettings(appDataDir, log) {
 	const file = cursorSettingsPath(appDataDir);
 	if (!fs.existsSync(file)) return 0;
-	if (restoreBackup(file, log)) return 1;
+	if (restoreBackup(file, log)) {
+		unmarkProxyOwnership(PROXY_OWNER_FILES.cursor, file);
+		return 1;
+	}
 	let settings;
 	try {
 		settings = parseJsonc(readText(file));
@@ -507,20 +585,27 @@ function rollbackCursorProxySettings(appDataDir, log) {
 	}
 	if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return 0;
 	let touched = false;
-	if (typeof settings['http.proxy'] === 'string' && /^http:\/\/127\.0\.0\.1:\d+$/.test(settings['http.proxy'])) {
+	const proxyUrl = typeof settings['http.proxy'] === 'string' ? settings['http.proxy'] : '';
+	const proxyOurs =
+		/^http:\/\/127\.0\.0\.1:\d+$/.test(proxyUrl) &&
+		proxyUrlOwnedByUs(PROXY_OWNER_FILES.cursor, file, proxyUrl, CURSOR_PROXY_DEFAULT_PORT);
+	if (proxyOurs) {
 		delete settings['http.proxy'];
 		touched = true;
 	}
-	if (settings['http.proxySupport'] === 'override') {
+	/* proxySupport=override 与 disableHttp2 只有在我们写入代理时才配套出现；
+	 * 代理键不归我们时保留（可能是用户自己的代理配套设置） */
+	if (proxyOurs && settings['http.proxySupport'] === 'override') {
 		delete settings['http.proxySupport'];
 		touched = true;
 	}
-	if (settings['cursor.general.disableHttp2'] === true) {
+	if (proxyOurs && settings['cursor.general.disableHttp2'] === true) {
 		delete settings['cursor.general.disableHttp2'];
 		touched = true;
 	}
 	if (touched) {
 		writeText(file, JSON.stringify(settings, null, '\t') + '\n');
+		unmarkProxyOwnership(PROXY_OWNER_FILES.cursor, file);
 		log('已移除 Cursor 代理配置');
 		return 1;
 	}
@@ -619,13 +704,18 @@ function writeCursorForDir(appDataDir, cfg, log) {
 			}
 		}
 		blob.aiSettings = ai;
-		vscdb.writeItem(file, CURSOR_BLOB_KEY, blob);
+		/* blob 与 API Key 必须同事务落库：分两次独立写入时，中途崩溃会留下
+		 *「地址已改、密钥未写」的半配置，Cursor 拿着旧密钥打新地址必然鉴权失败 */
+		vscdb.tx(file, (t) => {
+			t.write(CURSOR_BLOB_KEY, blob);
+			t.write(CURSOR_OPENAI_KEY_ITEM, cfg.apiKey);
+		});
 		log('已写入 Cursor 服务地址、开启自定义 Key、登记自定义模型，并把各场景默认模型指向 CCB');
 	} else {
 		log('警告：未找到 Cursor 设置存储，跳过服务地址写入（API Key 仍会写入）。');
+		vscdb.writeItem(file, CURSOR_OPENAI_KEY_ITEM, cfg.apiKey);
 	}
 
-	vscdb.writeItem(file, CURSOR_OPENAI_KEY_ITEM, cfg.apiKey);
 	log('已写入 Cursor API Key');
 	return true;
 }
@@ -1097,8 +1187,23 @@ function writeQoderCnVscdbModels(client, cfg, log) {
 	vscdb.backupDb(db, log);
 	const secretValue = JSON.stringify({ type: 'Buffer', data: Array.from(Buffer.from(blobB64, 'base64')) });
 
-	/* 保留非 CCB 条目，替换我们的（旧条目的 secret 一并清掉，避免孤儿 key 堆积） */
-	const existing = vscdb.readJson(db, QODER_CN_MODELS_KEY) || [];
+	/* 保留非 CCB 条目，替换我们的（旧条目的 secret 一并清掉，避免孤儿 key 堆积）。
+	 * 注意区分「键不存在」与「解析失败」：readJson 对两者都返回 null，若按空数组
+	 * 继续写会把 IDE 尚未被我们理解的格式（比如新版改成了加密/非 JSON）整体覆盖、
+	 * 静默丢用户已有自定义模型。解析失败必须中止。 */
+	const rawModels = vscdb.readItem(db, QODER_CN_MODELS_KEY);
+	let existing = [];
+	if (rawModels != null) {
+		try {
+			const parsed = JSON.parse(rawModels);
+			existing = Array.isArray(parsed) ? parsed : [];
+		} catch {
+			return {
+				ok: false,
+				error: '无法解析 IDE 现有的自定义模型数据（格式可能已随版本变化），已中止写入以避免覆盖。请更新 CCB 后重试',
+			};
+		}
+	}
 	const staleOurs = existing.filter(isOursQoderCnModel);
 	const kept = existing.filter((m) => !isOursQoderCnModel(m));
 	for (const m of staleOurs) {
@@ -1300,12 +1405,19 @@ function writeQoderCnProxySettings(client, port, log) {
 	const existed = fs.existsSync(file);
 	if (existed) {
 		try {
-			settings = parseJsonc(readText(file)) || {};
-		} catch {
-			settings = {};
+			settings = parseJsonc(readText(file));
+		} catch (e) {
+			/* 解析失败绝不能按空对象重写——那会把用户 settings.json 里全部其它
+			 * 设置（快捷键、主题、编辑器偏好…）整体抹掉（有 .bak 但用户无感知）。
+			 * 与 writeCursorProxySettings 的解析失败跳过策略保持一致。 */
+			log(`警告：Qoder settings.json 解析失败（${e.message}），跳过代理配置写入（原文件未改动）`);
+			return false;
+		}
+		if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+			log('警告：Qoder settings.json 不是对象，跳过代理配置写入（原文件未改动）');
+			return false;
 		}
 	}
-	if (!settings || typeof settings !== 'object' || Array.isArray(settings)) settings = {};
 	if (existed) backupOnce(file, log);
 	const app = settings.app && typeof settings.app === 'object' && !Array.isArray(settings.app) ? settings.app : {};
 	app.configAdvancedProxyMode = 'manual';
@@ -1313,6 +1425,9 @@ function writeQoderCnProxySettings(client, port, log) {
 	settings.app = app;
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	writeText(file, JSON.stringify(settings, null, '\t') + '\n');
+	/* 记录我们写入的代理地址：回滚时只删「值与我们一致」的键，
+	 * 避免把用户后来自己配置的同形态（127.0.0.1）代理误删 */
+	markProxyOwnership(PROXY_OWNER_FILES.qoder, file, proxyUrl);
 	log(`已写入 Qoder 代理设置（manual → ${proxyUrl}）`);
 	return true;
 }
@@ -1320,7 +1435,10 @@ function writeQoderCnProxySettings(client, port, log) {
 function rollbackQoderCnProxySettings(client, log) {
 	const file = qoderCnUserSettingsPath(client);
 	if (!fs.existsSync(file)) return 0;
-	if (restoreBackup(file, log)) return 1;
+	if (restoreBackup(file, log)) {
+		unmarkProxyOwnership(PROXY_OWNER_FILES.qoder, file);
+		return 1;
+	}
 	let settings;
 	try {
 		settings = parseJsonc(readText(file));
@@ -1331,19 +1449,23 @@ function rollbackQoderCnProxySettings(client, log) {
 	const app = settings.app;
 	if (!app || typeof app !== 'object' || Array.isArray(app)) return 0;
 	let touched = false;
-	if (app.configAdvancedProxyMode === 'manual') {
+	/* 只删「确认归我们所有」的代理设置（归属标记或默认端口），
+	 * 用户自己在 IDE 里配的同形态本机代理不得误删 */
+	const url = typeof app.configAdvancedProxyURL === 'string' ? app.configAdvancedProxyURL : '';
+	const urlOurs =
+		/^http:\/\/127\.0\.0\.1:\d+$/.test(url) &&
+		proxyUrlOwnedByUs(PROXY_OWNER_FILES.qoder, file, url, 9183);
+	if (app.configAdvancedProxyMode === 'manual' && urlOurs) {
 		delete app.configAdvancedProxyMode;
 		touched = true;
 	}
-	if (
-		typeof app.configAdvancedProxyURL === 'string' &&
-		/^http:\/\/127\.0\.0\.1:\d+$/.test(app.configAdvancedProxyURL)
-	) {
+	if (urlOurs) {
 		delete app.configAdvancedProxyURL;
 		touched = true;
 	}
 	if (touched) {
 		writeText(file, JSON.stringify(settings, null, '\t') + '\n');
+		unmarkProxyOwnership(PROXY_OWNER_FILES.qoder, file);
 		log('已移除 Qoder 代理设置');
 		return 1;
 	}
@@ -1710,12 +1832,21 @@ async function writeZCode(cfg, log, client, detected) {
 		return { ok: true };
 	}
 
-	const r = await selectZCodeModel({ exePath: exe, providerId: ZCODE_PROVIDER_KEY, modelId: model, label: client.name, log });
-	if (r.entries && r.entries.length) saveGuiChoice([root], 'ccb-zcode-gui.json', r.entries, log);
-
-	/* selectDefaultModel 会以调试端口拉起客户端，注入完立刻关掉（同 WorkBuddy 的处理） */
-	await sleep(800);
-	await stopClient(client);
+	/* selectDefaultModel 会以调试端口拉起客户端；调试端口开着时本机任意进程可读取
+	 * 客户端内凭据，所以无论成败还是中途抛异常都必须立刻关掉（try/finally，
+	 * 同 WorkBuddy / Trae 的处理） */
+	let r;
+	try {
+		r = await selectZCodeModel({ exePath: exe, providerId: ZCODE_PROVIDER_KEY, modelId: model, label: client.name, log });
+		if (r.entries && r.entries.length) saveGuiChoice([root], 'ccb-zcode-gui.json', r.entries, log);
+	} finally {
+		await sleep(800);
+		const stop = await stopClient(client);
+		if (!stop.stopped) {
+			log('警告：客户端未能自动退出，正在强制结束以关闭调试端口…');
+			await stopClient(client);
+		}
+	}
 
 	if (!r.ok) {
 		log(r.error);
@@ -1778,9 +1909,15 @@ async function rollbackZCode(log, client, detected) {
 		if (!exe) {
 			log('未找到程序位置，界面当前模型未还原。请点「详情」手动选择路径后重新回滚。');
 		} else {
-			const r = await restoreZCodeModel({ exePath: exe, entries, label: client.name, log });
-			await sleep(800);
-			await stopClient(client);
+			/* restore 同样以调试端口拉起客户端，异常时也必须保证关掉（try/finally） */
+			let r;
+			try {
+				r = await restoreZCodeModel({ exePath: exe, entries, label: client.name, log });
+			} finally {
+				await sleep(800);
+				const stop = await stopClient(client);
+				if (!stop.stopped) await stopClient(client);
+			}
 			if (r.ok) {
 				changed++;
 				for (const f of files) {
@@ -2310,9 +2447,15 @@ async function rollbackWorkBuddy(log, client, detected) {
 		if (!exe) {
 			log('未找到程序位置，界面默认模型未还原。请点「详情」手动选择路径后重新回滚。');
 		} else {
-			const r = await restoreWorkBuddyModel({ exePath: exe, entries, label: client.name, log });
-			await sleep(800);
-			await stopClient(client);
+			/* restore 同样以调试端口拉起客户端，异常时也必须保证关掉（try/finally） */
+			let r;
+			try {
+				r = await restoreWorkBuddyModel({ exePath: exe, entries, label: client.name, log });
+			} finally {
+				await sleep(800);
+				const stop = await stopClient(client);
+				if (!stop.stopped) await stopClient(client);
+			}
 			if (r.ok) {
 				changed++;
 				for (const f of snapshots) {
@@ -2407,7 +2550,7 @@ function guardProcesses(entry, client) {
  * @returns {string|null} 关闭失败时的错误信息
  */
 async function closeBeforeWrite(client, running, log) {
-	log(`检测到 ${running.join('、')} 正在运行，正在自动关闭以便安全写入…`);
+	log(`检测到 ${running.join('、')} 正在运行，正在自动关闭以便安全写入（若客户端里有未保存的编辑，请先保存；等待正常关闭超时后将强制结束进程）…`);
 	const { stopped } = await stopClient(client);
 	if (!stopped) {
 		const msg = `请先完全退出 ${client.name}（检测到 ${running.join('、')} 正在运行），再点一次一键配置`;

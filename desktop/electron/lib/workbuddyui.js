@@ -22,6 +22,7 @@
  */
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const { Cdp, findFreePort } = require('./traeui');
 
@@ -130,12 +131,18 @@ function modelIdCandidates(modelId) {
 /* ---------- 驱动 ---------- */
 
 function launchWithDebugPort(exePath, port) {
+	/* spawn 前先校验路径：exe 不存在时 spawn 会异步触发 error 事件，没有监听者
+	 * 会作为未捕获异常击穿 Electron 主进程 */
+	if (!fs.existsSync(exePath)) throw new Error(`未找到程序位置：${exePath}`);
 	const child = spawn(exePath, [`--remote-debugging-port=${port}`], {
 		detached: true,
 		stdio: 'ignore',
 		cwd: path.dirname(exePath),
 		env: process.env,
 	});
+	/* 启动失败只记日志：客户端拉不起来时后续 Cdp.connect 会以可读错误收尾，
+	 * error 事件无人监听会击穿主进程 */
+	child.on('error', (e) => console.error(`[workbuddyui] 客户端启动失败：${e.message || e}`));
 	child.unref();
 }
 
@@ -204,8 +211,8 @@ function collectChoiceKeys(uid, listedKeys, extraUids) {
  * @param {string} [opts.label] 日志用的产品名
  * @param {string[]} [opts.extraUids] 额外要覆盖的账号 uid（来自客户端的账号数据目录）
  * @param {(msg:string)=>void} opts.log
- * @returns {Promise<{ok:boolean, error?:string, model?:string, unverified?:boolean,
- *                    entries?:Array<{key:string, value:string|null}>}>}
+ * @returns {Promise<{ok:boolean, error?:string, warning?:string, model?:string,
+ *                    unverified?:boolean, entries?:Array<{key:string, value:string|null}>}>}
  *          entries 是各键写入前的原始值（键不存在则为 null），供回滚精确还原。
  */
 async function selectDefaultModel({ exePath, modelId, label, log, extraUids }) {
@@ -271,11 +278,14 @@ async function selectDefaultModel({ exePath, modelId, label, log, extraUids }) {
 			}
 			if (i === 0) log(`界面显示的是「${shown}」，改用不带前缀的模型名再试一次…`);
 		}
-		/* 两种格式都没能让界面显示我们的模型 → 退回第一种（有实证的格式），标记未确认 */
+		/* 两种格式都没能让界面显示我们的模型 → 退回第一种（有实证的格式），标记未确认。
+		 * 界面确认失败要给出可操作指引：硬编码的键名/选择器在客户端改版后可能静默失效 */
 		for (const key of keyList) {
 			await cdp.evaluate(buildChoiceScript(key, candidates[0]));
 		}
-		return { ok: true, model: shown, unverified: true, entries };
+		const why = '界面未能确认默认模型已生效，当前客户端版本可能与 CCB 不兼容，请更新 CCB 后重试';
+		log(why + '。');
+		return { ok: true, model: shown, unverified: true, warning: why, entries };
 	} catch (e) {
 		return { ok: false, error: e.message || String(e) };
 	} finally {

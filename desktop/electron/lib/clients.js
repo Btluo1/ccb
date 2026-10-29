@@ -332,7 +332,9 @@ function uninstallEntries() {
 	for (const root of roots) {
 		try {
 			const r = spawnSync('reg', ['query', root, '/s'], {
-				encoding: 'utf8', timeout: 20000, windowsHide: true,
+				/* 超时从 20s 收到 8s：该查询在主进程同步执行，超时即 UI 冻结时长；
+				 * 正常机器 1s 内返回，8s 已覆盖机械硬盘高负载场景 */
+				encoding: 'utf8', timeout: 8000, windowsHide: true,
 			});
 			if (r.status !== 0 || !r.stdout) continue;
 			let displayName = null;
@@ -470,7 +472,7 @@ function appxInfo(spec) {
 				'-NoProfile', '-NonInteractive', '-Command',
 				`Get-AppxPackage -Name '${spec.name}' | Select-Object -First 1 PackageFamilyName,InstallLocation | ConvertTo-Json -Compress`,
 			],
-			{ encoding: 'utf8', timeout: 15000, windowsHide: true }
+			{ encoding: 'utf8', timeout: 10000, windowsHide: true }
 		);
 		if (r.status === 0 && r.stdout && r.stdout.trim()) {
 			const j = JSON.parse(r.stdout.trim());
