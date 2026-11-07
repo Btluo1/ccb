@@ -512,10 +512,16 @@ function withClientLock(clientId, fn) {
 	const prev = clientLocks.get(clientId) || Promise.resolve();
 	const next = prev.catch(() => {}).then(fn);
 	clientLocks.set(clientId, next);
-	/* 链尾清理，防止 Map 无限增长（客户端 id 有限，双保险） */
-	next.finally(() => {
-		if (clientLocks.get(clientId) === next) clientLocks.delete(clientId);
-	});
+	/* 链尾清理，防止 Map 无限增长（客户端 id 有限，双保险）。
+	 * 注意清理链要先 .catch 再 .finally：next 本身可能拒绝（拒绝要交还给 IPC
+	 * 调用方），直接对 next .finally 会派生出一条同样被拒绝且无人接住的
+	 * promise，主进程里留下 unhandledRejection 噪音（Electron 下表现为
+	 * 控制台刷「An error occurred in a handler」双重报错） */
+	next
+		.catch(() => {})
+		.finally(() => {
+			if (clientLocks.get(clientId) === next) clientLocks.delete(clientId);
+		});
 	return next;
 }
 

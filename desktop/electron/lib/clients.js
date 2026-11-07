@@ -299,8 +299,15 @@ function regQueryUserEnv(name) {
 	return null;
 }
 
-/* 注册表 App Paths：覆盖任意盘符的自定义安装位置 */
+/* 注册表 App Paths：覆盖任意盘符的自定义安装位置。
+ * 查询结果带缓存（与 appxCache 同语义）：一次全量扫描要按 14 个客户端 × 候选 exe
+ * × 3 个注册表根逐个 spawnSync，主进程同步阻塞可达数秒；一键配置一次流程里
+ * detectClients 要跑三遍（检测 / 写入前 / 启动前），缓存后第二三遍几乎零开销。
+ * 「重新检测」传 fresh:true 清缓存，刚装好的应用仍能被发现。 */
+const appPathsCache = new Map();
 function regQueryExe(exeName) {
+	if (appPathsCache.has(exeName)) return appPathsCache.get(exeName);
+	let hit = null;
 	for (const root of APP_PATH_ROOTS) {
 		try {
 			const r = spawnSync('reg', ['query', root + '\\' + exeName, '/ve'], {
@@ -309,11 +316,15 @@ function regQueryExe(exeName) {
 			if (r.status === 0 && r.stdout) {
 				const m = r.stdout.match(/REG_SZ\s+(.+)/);
 				const v = m && m[1].trim();
-				if (v && exists(v)) return v;
+				if (v && exists(v)) {
+					hit = v;
+					break;
+				}
 			}
 		} catch {}
 	}
-	return null;
+	appPathsCache.set(exeName, hit);
+	return hit;
 }
 
 /* 卸载信息：InstallLocation 很多产品会写，DisplayIcon 更是几乎都写（指向 exe 或其所在目录的图标）。
@@ -724,11 +735,20 @@ function detectOne(c, customPaths) {
 /**
  * 检测全部客户端。
  * @param {object} [customPaths] 用户手动指定的路径
- * @param {{fresh?: boolean}} [opts] fresh —— 清掉 MSIX 应用包查询缓存后再扫
- *   （「重新检测」按钮用：刚装好的应用这次才能被发现，否则会命中上一次的未安装结果）
+ * @param {{fresh?: boolean}} [opts] fresh —— 清掉**全部**探测缓存后再扫
+ *   （「重新检测」按钮用：刚装好的应用这次才能被发现，否则会命中上一次的未安装结果）。
+ *   注意必须连卸载表 / 开始菜单快捷方式缓存一起清：很多客户端（装在自定义目录的
+ *   WorkBuddy / ZCode 等）只能靠这两处找到，此前只清 appxCache 的话，
+ *   「重新检测」对新装的这类客户端永远无效（缓存里还是旧快照），是
+ *   「明明刚装好却检测不到」的一个真实根因。
  */
 function detectClients(customPaths, opts) {
-	if (opts && opts.fresh) appxCache.clear();
+	if (opts && opts.fresh) {
+		appxCache.clear();
+		appPathsCache.clear();
+		uninstallCache = null;
+		shortcutCache = null;
+	}
 	return CLIENTS.map((c) => detectOne(c, customPaths));
 }
 

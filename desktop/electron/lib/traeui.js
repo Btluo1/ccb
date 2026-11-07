@@ -87,6 +87,17 @@ function findFreePort() {
 	});
 }
 
+/* taskkill 参数：/IM 的值必须紧跟其后。实测 `taskkill /IM /T xxx.exe` 直接报
+ * 「ERROR: Invalid syntax. Value expected for '/IM'」，命令整体不执行——
+ * v1.0.28 及之前这里写成 ['/IM','/T',name] / ['/F','/IM','/T',name] 的错误顺序，
+ * Trae 系客户端运行中时永远关不掉（错误又被 stdio:'ignore' 吞掉），
+ * 一键配置先干等 12 秒、再强杀还是失败又等 12 秒，最后报「请先完全退出」。
+ * 纯函数抽出来供单元测试钉死参数顺序（含真实 taskkill 语法校验）。 */
+function taskkillArgs(name, force) {
+	/* /F /T 均为开关、位置随意；/IM 必须与它的值相邻 */
+	return force ? ['/F', '/T', '/IM', name] : ['/IM', name, '/T'];
+}
+
 /** 关闭同产品所有实例（单实例客户端不关掉就开不出调试端口） */
 async function killRunning(exeNames, log) {
 	const names = (exeNames || []).filter((n) => isRunning(n));
@@ -105,13 +116,21 @@ async function killRunning(exeNames, log) {
 	/* 先礼貌关闭（给客户端保存状态的机会），超时再强制结束。
 	 * 用 spawnSync 保证 taskkill 真正执行完再进轮询（异步 spawn 不保证时序，可能
 	 * 进程还没杀就开始等退出）；/T 连整棵进程树一起结束——客户端的守护/子进程
-	 * 映像名与本体外壳不同，不带 /T 会漏杀，残留的子进程照样占着单实例锁 */
-	for (const n of names) spawnSync('taskkill', ['/IM', '/T', n], { stdio: 'ignore', windowsHide: true });
+	 * 映像名与本体外壳不同，不带 /T 会漏杀，残留的子进程照样占着单实例锁。
+	 * 执行失败（杀软拦截 / 权限不足 / 语法错误）必须记日志——静默失败时
+	 * 用户只会看到莫名的长时间等待，无从排查 */
+	for (const n of names) {
+		const r = spawnSync('taskkill', taskkillArgs(n, false), { stdio: 'ignore', windowsHide: true });
+		if (r.error || r.status !== 0) log(`taskkill ${n} 执行失败（${r.error ? r.error.message : 'exit ' + r.status}），将等待其自行退出`);
+	}
 	if (await waitGone(12000)) {
 		await sleep(1200);
 		return true;
 	}
-	for (const n of names) spawnSync('taskkill', ['/F', '/IM', '/T', n], { stdio: 'ignore', windowsHide: true });
+	for (const n of names) {
+		const r = spawnSync('taskkill', taskkillArgs(n, true), { stdio: 'ignore', windowsHide: true });
+		if (r.error || r.status !== 0) log(`taskkill /F ${n} 强制结束失败（${r.error ? r.error.message : 'exit ' + r.status}）`);
+	}
 	const gone = await waitGone(12000);
 	await sleep(1500);
 	return gone;
@@ -1064,4 +1083,4 @@ async function addCustomModels({ exePath, exeNames, label, cfg, log, rpcOpts, rp
 /** 展示名加 CCB 前缀：Trae 的模型列表里混着同名预置模型，不区分会看不懂 */
 const displayNameOf = (modelId) => `CCB ${modelId}`;
 
-module.exports = { addCustomModels, displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, RECT_TRIGGER, LOGIN_VISIBLE, ENSURE_APPEND_MODE, openModelSettings, readExisting, addOne, selectModel, RPC_FIND_SERVICE, RPC_LIST, buildRpcPayload, isRpcAddSuccess, rpcWaitModelList, rpcAddOne, addModelsViaRpc };
+module.exports = { addCustomModels, displayNameOf, findFreePort, buildFillScript, Cdp, SEL, waitFor, waitForWorkbench, waitForRect, RECT_TRIGGER, LOGIN_VISIBLE, ENSURE_APPEND_MODE, openModelSettings, readExisting, addOne, selectModel, RPC_FIND_SERVICE, RPC_LIST, buildRpcPayload, isRpcAddSuccess, rpcWaitModelList, rpcAddOne, addModelsViaRpc, taskkillArgs };

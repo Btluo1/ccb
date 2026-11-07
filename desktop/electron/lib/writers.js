@@ -77,6 +77,17 @@ function backupOnce(file, log) {
 	return true;
 }
 
+/** 默认模型的健壮取值：必须落在本次写入的模型清单内。
+ *  cfg.defaultModel 是平台原始 id，而清单可能按客户端做过映射（WorkBuddy /
+ *  CodeBuddy 用平台映射名），两者不一致时若照写，客户端会把「清单外的默认
+ *  模型」静默回落到自家内置模型——正是「配置成功却没效果」的一类隐性来源。
+ *  取不到清单内的值就退回清单第一个，保证写进去的默认模型一定真实存在。 */
+function pickDefaultModel(cfg) {
+	const models = Array.isArray(cfg.models) ? cfg.models : [];
+	if (cfg.defaultModel && models.includes(cfg.defaultModel)) return cfg.defaultModel;
+	return models[0] || '';
+}
+
 /* ---------- WorkBuddy / CodeBuddy（本地自定义模型 models.json） ----------
  * 腾讯系产品共用一套本地自定义模型机制：把模型写进用户主目录下的 models.json。
  * 读取路径（逆向自 app 内 main/module-base.js 的 getUserConfigPath）：
@@ -231,7 +242,7 @@ async function writeWorkBuddy(cfg, log, client, detected) {
 	const dirs = (client && client.configDirs) || [];
 	if (!dirs.length) return { ok: false, error: '未找到 WorkBuddy 配置目录' };
 	for (const dir of dirs) writeModelsJson(dir, cfg, log, true);
-	const model = cfg.defaultModel || cfg.models[0];
+	const model = pickDefaultModel(cfg);
 	for (const dir of dirs) writeDefaultModelField(dir, model, log);
 
 	/* models.json 只负责「把模型登记进列表」，界面默认用哪个模型由客户端自己存在 renderer 的
@@ -356,7 +367,7 @@ async function writeCodeBuddy(cfg, log, client) {
 	if (!dirs.length) return { ok: false, error: '未找到 CodeBuddy 配置目录' };
 	for (const dir of dirs) writeModelsJson(dir, cfg, log);
 
-	const model = cfg.defaultModel || cfg.models[0];
+	const model = pickDefaultModel(cfg);
 	for (const dir of dirs) writeDefaultModelField(dir, model, log);
 
 	let repointed = 0;
@@ -690,7 +701,7 @@ function writeCursorForDir(appDataDir, cfg, log) {
 		ai.modelOverrideEnabled = mergeIds(ai.modelOverrideEnabled);
 
 		/* 默认模型：把各场景当前模型指向我们的默认模型（自定义模型不支持 maxMode） */
-		const model = cfg.defaultModel || cfg.models[0];
+		const model = pickDefaultModel(cfg);
 		if (ai.modelConfig && typeof ai.modelConfig === 'object' && !Array.isArray(ai.modelConfig)) {
 			for (const scene of Object.keys(ai.modelConfig)) {
 				const cur = ai.modelConfig[scene];
@@ -1104,7 +1115,7 @@ async function writeQoder(cfg, log, client) {
 	await writeQoderCustoms(root, cfg, log);
 
 	/* 3) 默认模型指向 CCB，打开即为我们的模型 */
-	writeQoderDefaultModel(root, cfg.defaultModel || cfg.models[0], log, 'app', client.name);
+	writeQoderDefaultModel(root, pickDefaultModel(cfg), log, 'app', client.name);
 
 	/* 4) Qoder CN IDE 1.30+：vscdb 写入 + BYOK 配置注入（v4）。
 	 *    官方架构：自定义模型存 state.vscdb（aicoding.customModels + v10 加密 apiKey secret），
@@ -1538,7 +1549,7 @@ async function writeQoderAppCn(cfg, log, client) {
 
 	/* 3) 默认模型：写 .models/default，worker reconcile 补丁启动时优先读此值，
 	 *    否则 BYOK 模型永远解析回平台目录默认（与 QoderWork 同理） */
-	writeQoderDefaultModel(root, cfg.defaultModel || cfg.models[0], log, 'assistant', client.name);
+	writeQoderDefaultModel(root, pickDefaultModel(cfg), log, 'assistant', client.name);
 
 	/* 4) worker runtime 桥接补丁（关键链路）：Qoder CN 桌面版聊天走 @qoder-ai/qoder-cn-agent-sdk
 	 *    的 Node worker（原生 gRPC → 网关），服务端按权益开关拒绝自定义模型。不打补丁配置必然
@@ -1549,7 +1560,7 @@ async function writeQoderAppCn(cfg, log, client) {
 		return { ok: false, error: `${client.name} runtime 桥接失败：${e.message}` };
 	}
 
-	log(`完成。启动 ${client.name} 后默认模型即为 CCB ${cfg.defaultModel || cfg.models[0]}，直接聊天即可。`);
+	log(`完成。启动 ${client.name} 后默认模型即为 CCB ${pickDefaultModel(cfg)}，直接聊天即可。`);
 	return { ok: true };
 }
 
@@ -1700,7 +1711,7 @@ async function writeQoderWork(cfg, log, client) {
 	 * （writeQoder 走默认 'ccb'），两者 customs 分属不同目录。 */
 	await writeQoderCustoms(root, cfg, log, 'custom');
 	writeQoderWorkDb(client, cfg, log);
-	writeQoderDefaultModel(root, cfg.defaultModel || cfg.models[0], log, 'assistant', client.name);
+	writeQoderDefaultModel(root, pickDefaultModel(cfg), log, 'assistant', client.name);
 	/* 关键链路：worker runtime 桥接补丁。QoderWork 聊天走 Node worker 的原生 gRPC，
 	 * 服务端按权益开关拒绝自定义模型（FORBIDDEN 100406），不打补丁配置必然不可用，
 	 * 因此桥失败要如实报整体失败（详见 qoderbridge.js 头注释）。 */
@@ -1810,7 +1821,7 @@ async function writeZCode(cfg, log, client, detected) {
 	backupOnce(cliFile, log);
 	const cliCfg = readJsonObject(cliFile, log);
 	const base = cfg.apiBase.replace(/\/+$/, '');
-	const model = cfg.defaultModel || cfg.models[0];
+	const model = pickDefaultModel(cfg);
 	cliCfg.model = `${ZCODE_PROVIDER_KEY}/${model}`;
 	cliCfg.provider = {
 		...(cliCfg.provider && typeof cliCfg.provider === 'object' && !Array.isArray(cliCfg.provider)
@@ -2618,6 +2629,7 @@ module.exports = {
 	applyConfig,
 	rollbackConfig,
 	cleanupLegacyKiroEnv,
+	pickDefaultModel,
 	qoderWorkRow,
 	qoderEncrypt,
 	qoderDecrypt,

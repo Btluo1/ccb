@@ -29,6 +29,7 @@ const state = {
 	selection: {},
 	selectionInit: false,
 	keys: {},        // provider -> { apiKey, baseUrl }
+	keyError: '',    // ensureKey 最近一次失败原因（成功时清空），供结果区展示真实原因
 	apiBase: 'https://code.btluo.com/v1',
 	anthropicBase: 'https://code.btluo.com',
 	accountApiBase: 'https://ccb.btluo.com',
@@ -244,17 +245,36 @@ function renderModels() {
 }
 
 /* ================= 平台密钥（按 provider 缓存） ================= */
-async function ensureKey(provider) {
+/* ensureKey 的最近一次失败原因（成功时清空）：密钥没拿到就调写入器只会得到
+ * 干巴巴的「缺少 API Key」，把真实原因（登录过期 / 网络异常）记下来传给结果区 */
+async function ensureKey(provider, opts = {}) {
 	if (!provider) return null;
-	if (state.keys[provider]) return state.keys[provider];
+	/* force：跳过会话缓存现拉一次。写入前必须刷新——密钥可能在网页端被重置/
+	 * 吊销，拿旧缓存的密钥写进客户端会出现「配置成功但调用一直 401」 */
+	if (!opts.force && state.keys[provider]) return state.keys[provider];
 	const r = await window.ccb.api.currentKey(provider);
-	if (!r || r.error) return null;
+	if (!r || r.error) {
+		state.keyError = (r && r.error) || '服务端无响应';
+		return null;
+	}
 	let apiKey = null;
 	if (r.key && typeof r.key === 'object') apiKey = r.key.apiKey || r.key.key || null;
 	else if (typeof r.key === 'string') apiKey = r.key;
-	if (!apiKey) return null;
+	if (!apiKey) {
+		state.keyError = '服务端未返回密钥';
+		return null;
+	}
+	state.keyError = '';
 	state.keys[provider] = { apiKey, baseUrl: r.baseUrl || null };
 	return state.keys[provider];
+}
+
+/** ensureKey 失败原因转成用户可读文案（写入结果区用）；无记录返回 null */
+function keyFetchError() {
+	const msg = state.keyError || '';
+	if (!msg) return null;
+	if (/未登录|已过期/.test(msg)) return '登录已过期，请重新登录后再配置';
+	return `获取平台密钥失败：${msg}`;
 }
 
 function clientKey(c) {
@@ -585,8 +605,16 @@ async function applyAllInner() {
 		/* 1. 校验登录态并刷新余额 */
 		const p = await window.ccb.api.profile();
 		if (p.error || !p.user) {
-			toast('登录已过期，请重新登录');
-			await doLogout();
+			/* 只有确属登录态失效才强制登出：网络抖动（超时 / DNS 失败 / 服务端 5xx）
+			 * 也会走到这里，一律当「登录已过期」处理会把用户莫名登出、流程被迫中断
+			 * （服务端登录失效的固定文案是「未登录或登录已过期」） */
+			const msg = (p && p.error) || '获取账号信息失败';
+			if (/未登录|已过期/.test(msg)) {
+				toast('登录已过期，请重新登录');
+				await doLogout();
+			} else {
+				toast(`${msg}，请检查网络后重试`);
+			}
 			return;
 		}
 		setUser(p.user, p.usage);
@@ -605,6 +633,12 @@ async function applyAllInner() {
 				if (v.ok) list = v.models.map((id) => ({ id }));
 			}
 		}
+		if (!list.length && state.models.length) {
+			/* 配置写入本身是纯本地操作：模型接口临时不可用（中转站抖动 / 账号服务
+			 * 缓存未热）不该拦住整次配置，退回本地缓存列表继续，让用户先配好 */
+			list = state.models.map((x) => ({ id: x.id, codebuddyModel: x.codebuddyModel || x.id }));
+			toast('模型列表暂时获取失败，已使用本地缓存的模型列表继续配置');
+		}
 		if (!list.length) {
 			toast('未获取到可用模型，请稍后重试');
 			return;
@@ -621,10 +655,11 @@ async function applyAllInner() {
 			return;
 		}
 
-		/* 4. 拉取各 provider 的平台密钥 */
+		/* 4. 拉取各 provider 的平台密钥（写入前强制刷新：密钥可能在网页端被重置/
+		 * 吊销，拿会话缓存的旧密钥写进客户端会出现「配置成功但调用一直 401」） */
 		const providers = [...new Set(selected.map((c) => c.provider).filter(Boolean))];
 		for (const prov of providers) {
-			const k = await ensureKey(prov);
+			const k = await ensureKey(prov, { force: true });
 			if (!k) toast(`获取 ${prov} 平台密钥失败，相关客户端可能配置不完整`);
 		}
 
@@ -635,30 +670,63 @@ async function applyAllInner() {
 			const k = clientKey(c) || {};
 			state.running[c.id] = true;
 			renderClients();
-			const r = await window.ccb.applyConfig(c.id, {
-				apiKey: k.apiKey || '',
-				apiBase: clientApiBase(c),
-				anthropicBase: state.keys['anthropic'] ? (state.keys['anthropic'].baseUrl || state.anthropicBase) : state.anthropicBase,
-				models: clientModelIds(c),
-				defaultModel: state.defaultModel,
-			cursorMitm: c.id === 'cursor' ? { enabled: state.cursorMode === 'mitm' } : undefined,
-		});
-		const text = (r.log || []).concat(r.ok ? [] : [r.error || '写入失败']).join('\n');
-			state.lastLog[c.id] = { ok: !!r.ok, text };
-			state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: null };
-			state.running[c.id] = false;
-			renderClients();
+			try {
+				if (!k.apiKey) {
+					/* 密钥没拿到就不进写入器了：它只会报「缺少 API Key」，用户看不出
+					 * 真正原因（登录过期 / 网络异常），把原因直接写进结果与日志 */
+					const why = keyFetchError() || '获取平台密钥失败，请检查网络后重试';
+					state.lastLog[c.id] = { ok: false, text: why };
+					state.results[c.id] = { ok: false, text: why, warning: null, error: why, launch: null, proxyError: null };
+				} else {
+					const r = await window.ccb.applyConfig(c.id, {
+						apiKey: k.apiKey,
+						apiBase: clientApiBase(c),
+						anthropicBase: state.keys['anthropic'] ? (state.keys['anthropic'].baseUrl || state.anthropicBase) : state.anthropicBase,
+						models: clientModelIds(c),
+						defaultModel: state.defaultModel,
+						cursorMitm: c.id === 'cursor' ? { enabled: state.cursorMode === 'mitm' } : undefined,
+					});
+					/* 本地代理（Qoder CN / Cursor MITM）启动失败必须浮出来：配置虽然写进去了，
+					 * 但客户端的推理请求会全部转发失败——此前 proxy 结果被静默丢弃，
+					 * 用户看到「已配置并启动」却一条消息都发不出去 */
+					const proxyError =
+						r.ok && r.proxy && r.proxy.ok === false
+							? `本地代理启动失败（${r.proxy.error || '未知原因'}），客户端请求将无法转发到 CCB，请在「详情」里点「重新写入配置」重试`
+							: null;
+					const text = (r.log || [])
+						.concat(r.ok ? [] : [r.error || '写入失败'])
+						.concat(proxyError ? [proxyError] : [])
+						.join('\n');
+					state.lastLog[c.id] = { ok: !!r.ok, text };
+					state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: null, proxyError };
+				}
+			} catch (e) {
+				/* 单个客户端的 IPC 异常记入结果继续走完流程，不能把 running 卡死在「配置中…」 */
+				const why = '配置过程出错：' + ((e && e.message) || e || '未知错误');
+				state.lastLog[c.id] = { ok: false, text: why };
+				state.results[c.id] = { ok: false, text: why, warning: null, error: why, launch: null, proxyError: null };
+			} finally {
+				state.running[c.id] = false;
+				renderClients();
+			}
 		}
 
 		/* 6. 启动 / 重启全部选中客户端 */
 		for (const c of selected) {
-			if (!state.results[c.id]) state.results[c.id] = { ok: null, text: '', error: null, launch: null };
-			const l = await window.ccb.launchClient(c.id);
-			state.results[c.id].launch = l;
+			if (!state.results[c.id]) state.results[c.id] = { ok: null, text: '', error: null, launch: null, proxyError: null };
+			try {
+				const l = await window.ccb.launchClient(c.id);
+				state.results[c.id].launch = l;
+			} catch (e) {
+				state.results[c.id].launch = { status: 'failed', message: '启动请求失败：' + ((e && e.message) || e) };
+			}
 			renderClients();
 		}
 
 	showSummary(selected);
+	const proxyFailNames = selected
+		.filter((c) => { const r = state.results[c.id] || {}; return r.ok && r.proxyError; })
+		.map((c) => c.name);
 	const doneNames = selected.filter((c) => state.results[c.id] && state.results[c.id].ok).map((c) => c.name);
 	const needLoginNames = selected.filter((c) => {
 		const r = state.results[c.id] || {};
@@ -671,7 +739,9 @@ async function applyAllInner() {
 		const r = state.results[c.id] || {};
 		return r.ok && r.warning && !clientLoginReq(c);
 	}).length;
-	if (needLoginNames.length) {
+	if (proxyFailNames.length) {
+		toast(`${proxyFailNames.join('、')} 本地代理启动失败，客户端请求可能无法转发，请在「详情」里重试`);
+	} else if (needLoginNames.length) {
 		toast(`${needLoginNames.join('、')} 还差一步：先在客户端登录，再回来重新配置`);
 	} else if (doneNames.length && warnN) {
 		toast(`${doneNames.join('、')} 配置完成，需在客户端模型选择器里选一次 CCB 模型`);
@@ -766,6 +836,10 @@ function showSummary(selected) {
 		const launched = launch.status === 'launched' || launch.status === 'restarted';
 		const name = esc(c.name + (c.variant ? ' · ' + c.variant : ''));
 
+		/* 本地代理没起来：配置虽已写入，客户端请求也发不出去——按失败醒目提示 */
+		if (r.ok && r.proxyError) {
+			return `<div class="as-line fail"><b>${name}</b>：${esc(r.proxyError)}</div>`;
+		}
 		if (r.ok && launched && r.warning) {
 			return `<div class="as-line warn"><b>${name}</b>：模型已写入，但${esc(r.warning)}。可稍后在「详情」中重试。</div>`;
 		}
@@ -1136,24 +1210,52 @@ async function applyOne(c) {
 	const btn = $('#applyBtn');
 	if (btn) { btn.disabled = true; btn.textContent = '正在写入…'; }
 	try {
-		await ensureKey(c.provider);
+		/* 写入前强制刷新密钥（不用会话缓存的旧密钥，与一键配置一致） */
+		await ensureKey(c.provider, { force: true });
 		const k = clientKey(c) || {};
+		if (!k.apiKey) {
+			/* 密钥没拿到就不进写入器：把真实原因（登录过期 / 网络异常）写进结果区，
+			 * 而不是让写入器报一句看不出原因的「缺少 API Key」 */
+			const why = keyFetchError() || '获取平台密钥失败，请检查网络后重试';
+			state.lastLog[c.id] = { ok: false, text: why };
+			state.results[c.id] = {
+				...(state.results[c.id] || {}),
+				ok: false, text: why, warning: null, error: why,
+				launch: (state.results[c.id] || {}).launch || null,
+				proxyError: null,
+			};
+			renderClients();
+			renderPanel();
+			showSummary([c]);
+			toast(why);
+			return;
+		}
 		const r = await window.ccb.applyConfig(c.id, {
-			apiKey: k.apiKey || '',
+			apiKey: k.apiKey,
 			apiBase: clientApiBase(c),
 			anthropicBase: state.keys['anthropic'] ? (state.keys['anthropic'].baseUrl || state.anthropicBase) : state.anthropicBase,
 			models: clientModelIds(c),
 			defaultModel: state.defaultModel,
 			cursorMitm: c.id === 'cursor' ? { enabled: state.cursorMode === 'mitm' } : undefined,
 		});
-		const text = (r.log || []).concat(r.ok ? [] : [r.error || '写入失败']).join('\n');
+		/* 本地代理（Qoder CN / Cursor MITM）启动失败要浮出来，与一键配置一致 */
+		const proxyError =
+			r.ok && r.proxy && r.proxy.ok === false
+				? `本地代理启动失败（${r.proxy.error || '未知原因'}），客户端请求将无法转发到 CCB，请再点一次「重新写入配置」`
+				: null;
+		const text = (r.log || [])
+			.concat(r.ok ? [] : [r.error || '写入失败'])
+			.concat(proxyError ? [proxyError] : [])
+			.join('\n');
 		state.lastLog[c.id] = { ok: !!r.ok, text };
-		state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: (state.results[c.id] || {}).launch || null };
+		state.results[c.id] = { ok: !!r.ok, text, warning: r.warning || null, error: r.error || null, launch: (state.results[c.id] || {}).launch || null, proxyError };
 		renderClients();
 		renderPanel();
 		showSummary([c]);
 		const needLogin = clientLoginReq(c) && (r.ok === false ? /未登录/.test(r.error || '') : !!r.warning);
-		if (needLogin) {
+		if (proxyError) {
+			toast(`${c.name} 配置已写入，但本地代理启动失败，客户端请求将无法转发`);
+		} else if (needLogin) {
 			toast(`${c.name} 还差一步：先在客户端登录，再回来重新配置`);
 		} else if (r.ok && r.warning) {
 			toast(`${c.name} 配置已写入，需在模型选择器里选一次 CCB 模型`);
