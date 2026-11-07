@@ -175,9 +175,10 @@ async function streamUpstreamChat({ upstream, model, messages, log, signal }) {
 			throw e;
 		}
 		if (res.ok && res.body) return { body: res.body, release }; /* release 由调用方读完流后调用 */
+		/* 上游错误响应体可能回显请求头（含 Authorization），只记状态码 + 截断脱敏后的片段 */
 		const t = await res.text().catch(() => '');
 		release();
-		lastErr = new Error(`中转返回 HTTP ${res.status}：${t.slice(0, 300)}`);
+		lastErr = new Error(`中转返回 HTTP ${res.status}：${upstreamAdapter.redact(t)}`);
 		if (res.status >= 500 && attempt < MAX_ATTEMPTS) {
 			const waitMs = attempt * 1500;
 			log(`中转 5xx（第 ${attempt} 次）：HTTP ${res.status}，${waitMs}ms 后重试`);
@@ -381,8 +382,9 @@ async function availableModels(ctx) {
 	ctx.log(`已下发 CCB 模型目录（${names.length} 个）`);
 
 	/* 一次性抓包：把客户端请求原样转给真实后端，dump 真实模型目录字节，
-	 * 用于分析新版字段（namedModelSectionIndex 等）的字段号 */
-	if (!sniffedRealCatalog) {
+	 * 用于分析新版字段（namedModelSectionIndex 等）的字段号。
+	 * 默认关闭（响应体会落盘到用户目录），仅 CCB_CURSOR_DEBUG=1 调试时启用 */
+	if (!sniffedRealCatalog && process.env.CCB_CURSOR_DEBUG === '1') {
 		sniffedRealCatalog = true;
 		sniffRealCatalog(ctx).catch((e) => ctx.log(`目录抓包失败：${e.message}`));
 	}
@@ -436,8 +438,9 @@ async function bidiAppend(ctx) {
 				const info = extractAgentClient(raw);
 				if (info.kind === 'run_request') {
 					cacheChat(id, raw);
+					/* 隐私：不记用户消息内容，只记长度等元信息 */
 					log(
-						`BidiAppend：已缓存聊天请求 ${id}（${raw.length} 字节）模型=${info.modelId || '?'} 用户消息=${JSON.stringify(info.text.slice(0, 60))}`,
+						`BidiAppend：已缓存聊天请求 ${id}（${raw.length} 字节）模型=${info.modelId || '?'} 用户消息长度=${info.text.length}`,
 					);
 				} else if (info.kind === 'cancel') {
 					pendingChats.delete(id);
@@ -511,7 +514,7 @@ async function agentRunSSE(ctx) {
 		{ role: 'system', content: systemPrompt(model) },
 		{ role: 'user', content: userText || '（空消息）' },
 	];
-	log(`RunSSE：${id} → 模型 ${model}，用户消息 ${JSON.stringify(userText.slice(0, 80))}`);
+	log(`RunSSE：${id} → 模型 ${model}，用户消息长度=${userText.length}`);
 
 	res.writeHead(200, {
 		'Content-Type': 'application/connect+proto',
@@ -616,14 +619,27 @@ async function chatWithToolsSSE(ctx) {
 		return ctx.connectError(res, 'not_found', '聊天请求体不存在或已过期');
 	}
 	pendingChats.delete(id);
-	let wrapped;
+	/* 缓存里是 BidiAppend 写入的 AgentClientMessage（与 RunSSE 同源），必须用同一类型解读。
+	 * 之前误按 StreamUnifiedChatRequestWithTools 解码：protobuf 线格式兼容不抛错，
+	 * 只会解出空对象，结果把只剩 system prompt 的空对话发给上游 */
+	let info = null;
 	try {
-		wrapped = decode(T.StreamUnifiedChatRequestWithTools, pending.raw);
+		info = extractAgentClient(pending.raw);
 	} catch (e) {
-		log(`请求体解码失败（可能已加密）：${e.message}`);
-		return ctx.connectError(res, 'internal', `请求体解码失败：${e.message}`);
+		log(`StreamUnifiedChatWithToolsSSE：请求体解析失败 ${id}：${e.message}`);
 	}
-	return handleChatStream(ctx, wrapped.streamUnifiedChatRequest);
+	/* 防御：解不出预期结构（无 run_request）时把原始请求体原样透传真实后端，而不是发空对话 */
+	if (!info || info.kind !== 'run_request') {
+		log(`StreamUnifiedChatWithToolsSSE：${id} 缓存缺少 run_request，原样透传真实后端`);
+		if (ctx.passthrough) return ctx.passthrough();
+		return ctx.connectError(res, 'internal', '请求体解析失败');
+	}
+	/* 组装成 handleChatStream 需要的 unified 请求形态（空消息占位与 RunSSE 保持一致） */
+	const unifiedReq = {
+		modelDetails: { modelId: info.modelId || '' },
+		conversation: [{ type: 1, text: info.text || '（空消息）' }],
+	};
+	return handleChatStream(ctx, unifiedReq);
 }
 
 /** 流式：旧版聊天链路（body 直接是 StreamUnifiedChatRequest） */

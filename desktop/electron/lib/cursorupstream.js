@@ -38,6 +38,14 @@ function normalize(upstream = {}) {
 	};
 }
 
+/** 上游错误响应体可能回显请求头（含 Authorization）：截断并脱敏后才允许进日志/错误消息 */
+function redact(text, max = 160) {
+	return String(text || '')
+		.slice(0, max)
+		.replace(/(bearer\s+)[^\s"']+/gi, '$1***')
+		.replace(/sk-[\w.-]+/gi, 'sk-***');
+}
+
 /** 认证头：Authorization 用 Bearer 前缀，其它自定义头（如 cursor-agent 的 X-API-Key）裸填 */
 function authHeaders(up) {
 	const name = up.apiKeyHeader || DEFAULT_API_KEY_HEADER;
@@ -209,7 +217,7 @@ async function completeOnce(up, { model, messages, maxTokens = 0, signal } = {})
 	try {
 		if (!res.ok) {
 			const t = await res.text().catch(() => '');
-			throw new Error(`上游 HTTP ${res.status}：${t.slice(0, 200)}`);
+			throw new Error(`上游 HTTP ${res.status}：${redact(t)}`);
 		}
 		const j = await res.json();
 		if (up.apiFormat === 'anthropic') {
@@ -226,6 +234,7 @@ async function completeOnce(up, { model, messages, maxTokens = 0, signal } = {})
 
 module.exports = {
 	normalize,
+	redact,
 	authHeaders,
 	chatRequest,
 	chatUrl,

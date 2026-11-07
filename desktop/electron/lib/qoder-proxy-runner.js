@@ -113,8 +113,10 @@ function runServer() {
 					try {
 						const v = JSON.parse(fs.readFileSync(relayFile, 'utf8'));
 						if (typeof v === 'string' && v) {
-							qoderproxy.setRelayBaseUrl(v);
-							console.log('[qoder-proxy-runner] relay 地址已热更新 →', v);
+							/* setRelayBaseUrl 内置校验（仅 https，回环开发允许 http）：
+							 * 非法值拒绝并保留旧地址，防止热更新把密钥重定向到不可信端点 */
+							if (qoderproxy.setRelayBaseUrl(v)) console.log('[qoder-proxy-runner] relay 地址已热更新 →', v);
+							else console.log('[qoder-proxy-runner] 忽略非法 relay 地址：', v);
 						}
 					} catch { /* 解析失败保留旧地址 */ }
 				}, 500);

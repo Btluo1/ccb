@@ -23,7 +23,8 @@ function tasklistHas(exeName) {
 	try {
 		const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${exeName}`, '/FO', 'CSV', '/NH'], {
 			encoding: 'utf8',
-			timeout: 8000,
+			/* 超时 8s→4s：主进程同步调用，超时即 UI 冻结；tasklist 正常 <500ms */
+			timeout: 4000,
 			windowsHide: true,
 		});
 		if (r.status === 0 && r.stdout) {

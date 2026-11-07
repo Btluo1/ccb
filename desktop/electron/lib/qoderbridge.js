@@ -629,6 +629,39 @@ function assertWritable(file) {
 	}
 }
 
+/** 原子写盘：先写同目录临时文件再 rename。直接覆盖写时进程崩溃/断电会留下
+ *  截断的 runtime（数 MB 的 JS 写一半是必崩的），原子 rename 后要么旧要么新。 */
+function atomicWriteFile(file, content) {
+	const tmp = file + '.ccb-tmp';
+	fs.writeFileSync(tmp, content, 'utf8');
+	try {
+		fs.renameSync(tmp, file);
+	} catch (e) {
+		/* 跨设备/占用等极端场景回退直接写（保持与原行为一致） */
+		try { fs.rmSync(tmp, { force: true }); } catch {}
+		fs.writeFileSync(file, content, 'utf8');
+	}
+}
+
+/** 写后语法校验：用 process.execPath 以 ELECTRON_RUN_AS_NODE=1 运行即可当 node 用，
+ *  应用内必然可用；不再依赖用户机器全局安装 node（没装就跳过校验 = 把语法错误直接落盘，
+ *  worker 启动即崩，与「写盘后校验」的安全网承诺矛盾）。 */
+function syntaxCheck(file) {
+	try {
+		const chk = spawnSync(process.execPath, ['--check', file], {
+			encoding: 'utf8',
+			env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+			windowsHide: true,
+		});
+		if (chk.error) return { ok: true, skipped: true };
+		return chk.status === 0
+			? { ok: true }
+			: { ok: false, detail: String(chk.stderr || chk.stdout).slice(0, 300) };
+	} catch {
+		return { ok: true, skipped: true };
+	}
+}
+
 /** 包一层写盘操作，权限类错误翻译成指引文案，其余原样抛出 */
 function withWriteGuard(fn, file) {
 	try {
@@ -648,12 +681,15 @@ function patchQoderWorkRuntime(file, log) {
 		|| src.indexOf(PGUARD_MARK) >= 0 || src.indexOf(RGUARD_MARK) >= 0
 		|| src.indexOf(TGUARD_MARK) >= 0 || src.indexOf(XGUARD_MARK) >= 0;
 	let out = src;
-	/* 幂等更新：先剥离旧 span，保证各锚点形状可重新提取 */
+	/* 幂等更新：先剥离旧 span，保证各锚点形状可重新提取。
+	 * guard 也必须参与幂等：旧版「GUARD_BEGIN 存在即跳过」会让 CCB 升级 guardSource
+	 * 模板后老 guard 永不更新，与新 bridge 版本错配。 */
 	if (src.indexOf(PGUARD_MARK) >= 0) out = stripPolicyGuard(out);
 	if (src.indexOf(RGUARD_MARK) >= 0) out = stripReconcileGuard(out);
 	if (src.indexOf(TGUARD_MARK) >= 0) out = stripFactoryWrapper(out);
 	if (src.indexOf(XGUARD_MARK) >= 0) out = stripXlGuard(out);
-	if (src.indexOf(GUARD_BEGIN) < 0) {
+	if (src.indexOf(GUARD_BEGIN) >= 0) out = stripGuard(out);
+	{
 		const a = extractAnchor(out);
 		if (!a.ok) {
 			throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${a.reason}），已中止且未修改文件`);
@@ -695,7 +731,9 @@ function patchQoderWorkRuntime(file, log) {
 	 * writeDefaultModelCache 函数（l$A）。extractXlPatch 自动识别两者，缺失才跳过。 */
 	const xp = extractXlPatch(out);
 	if (!xp.ok) {
-		log(`提示：该 runtime 无目录同步回写段（${xp.reason}），跳过回写保护补丁。`);
+		/* 回写保护缺失会让启动/刷新把默认模型踩回平台默认——用户感知是「配置成功
+		 * 却没效果」，必须醒目告警并给出可操作指引，而不是一条普通提示 */
+		log(`警告：未匹配到目录同步回写段（${xp.reason}），回写保护补丁未生效。客户端版本可能已与当前 CCB 不兼容，默认模型可能被重置回平台默认；请更新 CCB 后重新写入配置。`);
 	} else {
 		if (xp.type === 'qw') xp.cacheFn = rp.cacheFn; /* QoderWork：缓存读取函数与 reconcile 同源 */
 		const xo = applyXlPatch(out, xp);
@@ -709,19 +747,22 @@ function patchQoderWorkRuntime(file, log) {
 		log('QoderWork runtime 补丁已存在且为最新，无需重写。');
 		return true;
 	}
-	/* 备份（恒为首次写入前的原始状态），再写盘；权限类失败给出排查指引 */
+	/* 备份语义：bak 必须是「当前代 runtime 的未补丁原版」。
+	 * 文件里没有我们的标记（首次补丁，或客户端 fast-update 升级把补丁覆盖掉）时，
+	 * 旧 bak 属于上一代 runtime，继续保留会让回滚把旧版代码写进新版 → 版本错配即崩，
+	 * 必须刷新为当前文件；标记还在说明同一代，保留首次补丁前的原版不动。 */
 	const bak = file + BACKUP_SUFFIX;
 	withWriteGuard(() => {
-		if (!fs.existsSync(bak)) fs.copyFileSync(file, bak);
-		fs.writeFileSync(file, out, 'utf8');
+		if (!hadAny || !fs.existsSync(bak)) fs.copyFileSync(file, bak);
+		atomicWriteFile(file, out);
 	}, file);
 	/* 语法安全网：校验失败时用内存里的原始内容还原（不依赖备份，防版本错配） */
-	const chk = spawnSync('node', ['--check', file], { encoding: 'utf8' });
-	if (chk.error) {
-		log('提示：未找到 node 命令，跳过写后语法校验。');
-	} else if (chk.status !== 0) {
-		fs.writeFileSync(file, src, 'utf8');
-		throw new Error(`补丁后语法校验失败，已还原原文件：${String(chk.stderr || chk.stdout).slice(0, 300)}`);
+	const chk = syntaxCheck(file);
+	if (chk.skipped) {
+		log('提示：写后语法校验不可用，已跳过。');
+	} else if (!chk.ok) {
+		atomicWriteFile(file, src);
+		throw new Error(`补丁后语法校验失败，已还原原文件：${chk.detail}`);
 	}
 	/* Qoder CN 的 fast-update 清单会校验 worker hash，不符则启动时还原——同步之 */
 	syncFastUpdateManifest(file, log);
@@ -737,11 +778,27 @@ function rollbackQoderWorkRuntime(file, log) {
 	assertWritable(file);
 	const bak = file + BACKUP_SUFFIX;
 	if (fs.existsSync(bak)) {
-		withWriteGuard(() => fs.copyFileSync(bak, file), file);
-		syncFastUpdateManifest(file, log);
-		log(`已从备份还原 ${path.basename(file)}`
-			+ `（若 QoderWork 本身升级过，旧备份可能不再匹配，请改用「重新写入配置」）。`);
-		return true;
+		/* 只有「当前文件还带着我们的补丁标记」才能用备份覆盖还原——这说明文件与
+		 * 备份同属一代 runtime。客户端 fast-update 升级后补丁被官方新文件覆盖，
+		 * 标记消失，此时 bak 是上一代代码，覆盖还原 = 把旧版 runtime 写进新版
+		 * 安装目录，版本错配即崩，必须跳过（此时也无补丁可剥离，无事可做）。 */
+		const cur = fs.readFileSync(file, 'utf8');
+		const patched =
+			cur.indexOf(MARK_BEGIN) >= 0 || cur.indexOf(GUARD_BEGIN) >= 0 ||
+			cur.indexOf(PGUARD_MARK) >= 0 || cur.indexOf(RGUARD_MARK) >= 0 ||
+			cur.indexOf(TGUARD_MARK) >= 0 || cur.indexOf(XGUARD_MARK) >= 0;
+		if (patched) {
+			withWriteGuard(() => {
+				const tmp = file + '.ccb-tmp';
+				fs.copyFileSync(bak, tmp);
+				try { fs.renameSync(tmp, file); } catch { try { fs.rmSync(tmp, { force: true }); } catch {} fs.copyFileSync(bak, file); }
+			}, file);
+			syncFastUpdateManifest(file, log);
+			log(`已从备份还原 ${path.basename(file)}。`);
+			return true;
+		}
+		log('当前 runtime 不含 CCB 补丁（客户端可能已升级并覆盖了补丁），跳过备份还原以避免把旧版代码写进新版。');
+		return false;
 	}
 	const src = fs.readFileSync(file, 'utf8');
 	let out = stripGuard(src);
@@ -751,11 +808,11 @@ function rollbackQoderWorkRuntime(file, log) {
 	out = stripXlGuard(out);
 	out = stripBridge(out);
 	if (out === src) return false;
-	withWriteGuard(() => fs.writeFileSync(file, out, 'utf8'), file);
-	/* 剥离是注入的逆操作，仅在 node 可用时顺手校验；失败则用内存原内容还原 */
-	const chk = spawnSync('node', ['--check', file], { encoding: 'utf8' });
-	if (!chk.error && chk.status !== 0) {
-		fs.writeFileSync(file, src, 'utf8');
+	withWriteGuard(() => atomicWriteFile(file, out), file);
+	/* 剥离是注入的逆操作；语法校验异常时用内存原内容还原 */
+	const chk = syntaxCheck(file);
+	if (!chk.skipped && !chk.ok) {
+		atomicWriteFile(file, src);
 		log('提示：剥离后的内容语法校验异常，已还原保持原样。');
 		return false;
 	}

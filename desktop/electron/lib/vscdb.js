@@ -23,7 +23,14 @@ function stateDbPath(appDataDir) {
 }
 
 function open(file, readOnly) {
-	return new DatabaseSync(file, { readOnly: !!readOnly });
+	const db = new DatabaseSync(file, { readOnly: !!readOnly });
+	/* busy_timeout：进程守卫（先查 tasklist 再写库）与真正写库之间存在 TOCTOU 窗口——
+	 * 用户可能恰在此间重开 IDE 抢回数据库锁。无 busy_timeout 时 SQLITE_BUSY 直接抛错
+	 * 整批失败；给 3 秒让短暂的锁竞争自行消解，超时仍失败才报错。 */
+	if (!readOnly) {
+		try { db.exec('PRAGMA busy_timeout = 3000'); } catch {}
+	}
+	return db;
 }
 
 /** 读取单个 key 的字符串值；不存在返回 null */
@@ -61,9 +68,12 @@ function readJson(file, key) {
 	}
 }
 
-/** 备份整库（连同 WAL/SHM），已存在备份则覆盖为最新 */
+/** 备份整库（连同 WAL/SHM），只在无备份时做一次：
+ *  二次写入不得覆盖首次写入前的快照，否则快照里已是 CCB 写过的内容，
+ *  灾难恢复/回滚就回不到用户原始状态（与 writers.js 的 backupOnce 同语义） */
 function backupDb(file, log) {
 	if (!fs.existsSync(file)) return false;
+	if (fs.existsSync(file + '.ccb.bak')) return false;
 	for (const suffix of ['', '-wal', '-shm']) {
 		const src = file + suffix;
 		if (fs.existsSync(src)) {
@@ -74,13 +84,49 @@ function backupDb(file, log) {
 	return true;
 }
 
-/** 写入单个 key（字符串或对象）。写入前整库备份。 */
+/** 写入单个 key（字符串或对象）。多 key 写入请用 tx() 保证原子性。 */
 function writeItem(file, key, value) {
 	const db = open(file, false);
 	try {
-		const text = typeof value === 'string' ? value : JSON.stringify(value);
-		// ItemTable 的 key 声明为 UNIQUE ON CONFLICT REPLACE，用 INSERT OR REPLACE 完成 upsert
-		db.prepare(`INSERT OR REPLACE INTO ${ITEM_TABLE} (key, value) VALUES (?, ?)`).run(key, text);
+		writeItemDb(db, key, value);
+	} finally {
+		db.close();
+	}
+}
+
+/** 在已打开的连接上写入单个 key（tx 内部用） */
+function writeItemDb(db, key, value) {
+	const text = typeof value === 'string' ? value : JSON.stringify(value);
+	// ItemTable 的 key 声明为 UNIQUE ON CONFLICT REPLACE，用 INSERT OR REPLACE 完成 upsert
+	db.prepare(`INSERT OR REPLACE INTO ${ITEM_TABLE} (key, value) VALUES (?, ?)`).run(key, text);
+}
+
+/** 在已打开的连接上删除单个 key（tx 内部用） */
+function deleteItemDb(db, key) {
+	const r = db.prepare(`DELETE FROM ${ITEM_TABLE} WHERE key = ?`).run(key);
+	return !!(r && r.changes);
+}
+
+/**
+ * 多 key 写操作的事务封装：同一连接内 BEGIN IMMEDIATE … COMMIT，
+ * 任一步骤抛错则 ROLLBACK——避免「blob 已改、key 未写」这类半配置状态。
+ * fn 接收 { write(key,value), del(key), db }。
+ */
+function tx(file, fn) {
+	const db = open(file, false);
+	try {
+		db.exec('BEGIN IMMEDIATE');
+		const api = {
+			write: (key, value) => writeItemDb(db, key, value),
+			del: (key) => deleteItemDb(db, key),
+			db,
+		};
+		const r = fn(api);
+		db.exec('COMMIT');
+		return r;
+	} catch (e) {
+		try { db.exec('ROLLBACK'); } catch {}
+		throw e;
 	} finally {
 		db.close();
 	}
@@ -121,4 +167,5 @@ module.exports = {
 	deleteItem,
 	backupDb,
 	restoreDb,
+	tx,
 };

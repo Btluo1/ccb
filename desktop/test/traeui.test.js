@@ -24,9 +24,9 @@ describe('Trae UI 自动化：纯逻辑', () => {
 
 	it('选择器都指向实测过的类名，避免改错地方（新旧两代 UI 同时覆盖）', () => {
 		/* 旧版（TraeWork CN 1.107.1）与新版（TraeCode CN 2026-09）各有前缀，逗号多选择器并存 */
-		expect(SEL.modelTrigger).toBe('.core-model-select-trigger, .icd-model-select-trigger');
-		expect(SEL.modelMenu).toBe('.core-model-select-portal, .icube-model-select-portal');
-		expect(SEL.menuFooterAdd).toBe('.core-model-select-footer-action, .icube-model-select-portal-footer');
+		expect(SEL.modelTrigger).toBe('.core-model-select-trigger, .icd-model-select-trigger, [class*="model-select-trigger"]');
+		expect(SEL.modelMenu).toBe('.core-model-select-portal, .icube-model-select-portal, [class*="model-select-portal"]');
+		expect(SEL.menuFooterAdd).toBe('.core-model-select-footer-action, .icube-model-select-portal-footer, [class*="model-select"][class*="footer"]');
 		expect(SEL.dialog).toBe('.icd-modal-overlay.add-model-dialog');
 		expect(SEL.dialogSubmit).toBe('.add-model-connect-button');
 		/* 新版提交先跑连通性测试，失败后弹窗里才出现「直接保存」（跳过测试入库） */
@@ -157,6 +157,29 @@ describe('Trae UI 自动化：等待与未登录检测', () => {
 		const res = await waitForWorkbench(cdp, 1, 'TRAE CN', () => {}, { pollMs: 2, deadlineMs: 80 });
 		expect(res.error).toMatch(/主界面/);
 		expect(calls.length).toBe(0);
+	});
+
+	it('waitForWorkbench：从未发现任何调试窗口 → 报错区分「客户端可能未成功启动」（2026-10-22 用户超时无法远程定位根因后补的诊断分支）', async () => {
+		const { cdp } = scriptedCdp(() => null);
+		const res = await waitForWorkbench(cdp, 0, 'TRAE CN', () => {}, { pollMs: 2, deadlineMs: 60 });
+		expect(res.error).toMatch(/没有发现任何客户端调试窗口/);
+	});
+
+	it('waitForWorkbench：发现过窗口但选择器不出 → 错误文案带窗口名，便于远程排障', async () => {
+		const origList = Cdp.listPages;
+		const origOpen = Cdp.open;
+		Cdp.listPages = async () => [{ type: 'page', url: 'file:///x/solo/solo-lite.html', title: '', webSocketDebuggerUrl: 'ws://test/solo' }];
+		Cdp.open = async () => ({ ws: { url: 'ws://test/solo', readyState: 1 }, evaluate: async () => null });
+		try {
+			const { cdp } = scriptedCdp(() => null, { url: 'ws://test/dead', readyState: 3 });
+			const res = await waitForWorkbench(cdp, 0, 'TRAE CN', () => {}, { pollMs: 2, deadlineMs: 60 });
+			expect(res.error).toMatch(/主界面等待超时/);
+			expect(res.error).toContain('solo-lite.html');
+			expect(res.error).toMatch(/AI 对话主界面/);
+		} finally {
+			Cdp.listPages = origList;
+			Cdp.open = origOpen;
+		}
 	});
 
 	it('waitForRect：坐标表达式先返回 null 后返回 JSON，要等它出现（连通性测试期间提交按钮禁用）', async () => {
