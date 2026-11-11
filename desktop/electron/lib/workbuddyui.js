@@ -17,8 +17,20 @@
  *   - 写入键值 + 刷新页面后，模型选择器从「快速」变为「glm-5.3」；
  *   - 硬杀进程（taskkill /F /T）再重启，键值仍在，说明确实落了盘。
  *
- * 约束：客户端必须已登录（uid 取自 URL 的 accountSnapshot；未登录时取不到，会明确报错）。
- * 界面结构由版本决定，选择器集中在下面的常量里，便于版本变更时修。
+ * 2026-11-11 WorkBuddy AI 5.9.4 复测：键名 / URL 结构 / uid 解析（双重 encodeURIComponent）
+ * 均未变。但启动链路多两种坑（本机实测）：
+ *   1) 常驻更新器（Temp\workbuddy-update-x64\WorkBuddy-Setup-*.exe）会**劫持冷启动**：
+ *      我们带调试端口拉的进程把启动请求转交给它，它重新拉起的实例**不带调试参数**，
+ *      端口永远开不出来。此时再补一次带新端口的启动即可——已有实例在场时新实例
+ *      能正常开出调试端口（实测）。
+ *   2) 启动早期存在「登录态还没恢复」的窗口阶段：CDP 连上时页面有文本（READY 通过）
+ *      但 URL 里还没有 accountSnapshot，登录会话恢复后才补上。一次读取就把这种瞬时态
+ *      定论成「未登录」，正是「客户端明明已登录却提示先登录」的误报来源。
+ *   因此「等主界面 + 读账号」改为：全目标池扫描（谁带账号 uid 用谁，新窗口持续纳入）+
+ *   读到 uid 前持续轮询宽限（会话晚恢复也能等到），连接失败再补拉一次。
+ *
+ * 约束：客户端必须已登录（uid 取自 URL 的 accountSnapshot；宽限期内所有窗口都取不到
+ * 才报未登录）。界面结构由版本决定，选择器集中在下面的常量里，便于版本变更时修。
  */
 
 const { spawn } = require('child_process');
@@ -159,6 +171,64 @@ async function waitFor(cdp, expr, timeoutMs, what) {
 }
 
 /**
+ * 等任意客户端窗口「就绪并带账号 uid」，返回该窗口的连接。
+ *
+ * 不能盲连 /json/list 第一个目标再一次性读 uid（旧逻辑，已废）：
+ *   - 第一个目标可能是启动期的过渡窗口（无 accountSnapshot，但 READY 靠它的文本通过）；
+ *   - 主窗口的登录会话恢复较慢时，连上瞬间 URL 里也没有 accountSnapshot；
+ *   一次读取就把这两种瞬时态误报成「未登录」（5.9.4 用户实测复现）。
+ * 这里持续把全部 page 目标纳入池子逐个探测：谁先「READY 且带 uid」用谁，
+ * 直到宽限窗口耗尽——登录会话晚恢复、窗口先后顺序变化都能等到。
+ *
+ * @returns {Promise<{cdp:Cdp|null, uid:string|null, sawPage:boolean}>}
+ *          sawPage=false 表示直到超时都没出现过任何调试窗口（连接层失败，调用方应重试）
+ */
+async function waitForAccountWindow(port, name, log, timeoutMs = 120000) {
+	const deadline = Date.now() + timeoutMs;
+	const pool = new Map(); /* webSocketDebuggerUrl -> Cdp */
+	const closePool = (keep) => {
+		for (const [url, c] of pool) {
+			if (c === keep) continue;
+			try { c.close(); } catch {}
+			pool.delete(url);
+		}
+	};
+	let sawPage = false;
+	let announced = false;
+	while (Date.now() < deadline) {
+		let pages = [];
+		try { pages = await Cdp.listPages(port); } catch {}
+		if (pages.length) sawPage = true;
+		for (const p of pages) {
+			if (!pool.has(p.webSocketDebuggerUrl)) {
+				try {
+					pool.set(p.webSocketDebuggerUrl, await Cdp.open(p.webSocketDebuggerUrl));
+				} catch {}
+			}
+		}
+		for (const [url, c] of pool) {
+			if (c.ws.readyState !== 1) { pool.delete(url); continue; }
+			let ready = false;
+			try { ready = !!(await c.evaluate(READY_SCRIPT)); } catch {}
+			if (!ready) continue;
+			let uid = null;
+			try { uid = await c.evaluate(UID_SCRIPT); } catch {}
+			if (uid) {
+				closePool(c);
+				return { cdp: c, uid, sawPage };
+			}
+			if (!announced) {
+				announced = true;
+				log(`${name} 界面已连上，登录会话还在恢复，继续等待账号信息…`);
+			}
+		}
+		await sleep(800);
+	}
+	closePool(null);
+	return { cdp: null, uid: null, sawPage };
+}
+
+/**
  * 刷新页面并读回模型选择器上的文字。
  *
  * 必须用「打标记」的方式判断新文档是否接管：Page.reload 之后旧文档会短暂继续应答，
@@ -217,16 +287,32 @@ function collectChoiceKeys(uid, listedKeys, extraUids) {
  */
 async function selectDefaultModel({ exePath, modelId, label, log, extraUids }) {
 	const name = label || 'WorkBuddy';
-	const port = await findFreePort();
 
-	log(`正在以调试模式启动 ${name}，把界面上的默认模型设为 CCB 的…`);
-	launchWithDebugPort(exePath, port);
-
+	/* 连接 + 读账号，失败补拉一次（最多 2 次尝试）：
+	 * 5.9.4 常驻更新器会劫持冷启动、剥掉调试参数，端口开不出来（sawPage=false）；
+	 * 此时客户端已被更新器拉起，再带新端口补拉一次即可开出调试口（实测）。
+	 * 「连上了但读不到账号」（sawPage=true）不重试——那是登录宽限耗尽，重拉也一样。 */
 	let cdp = null;
-	try {
-		cdp = await Cdp.connect(port, 120000);
-		await waitFor(cdp, READY_SCRIPT, 120000, '主界面');
+	let port = 0;
+	for (let attempt = 0; attempt < 2 && !cdp; attempt++) {
+		port = await findFreePort();
+		if (attempt) log(`调试端口没开出来（可能被更新器接管了启动），换个端口再拉一次…`);
+		log(`正在以调试模式启动 ${name}，把界面上的默认模型设为 CCB 的…`);
+		launchWithDebugPort(exePath, port);
+		const r = await waitForAccountWindow(port, name, log);
+		if (r.cdp) {
+			cdp = r.cdp;
+			break;
+		}
+		if (r.sawPage) {
+			return { ok: false, error: `读不到 ${name} 的账号信息，请先在 ${name} 里登录，再点一次一键配置` };
+		}
+	}
+	if (!cdp) {
+		return { ok: false, error: `未能连上 ${name} 的调试端口：客户端可能没有成功启动，请完全退出 ${name} 后重试` };
+	}
 
+	try {
 		const uid = await cdp.evaluate(UID_SCRIPT);
 		if (!uid) {
 			return { ok: false, error: `读不到 ${name} 的账号信息，请先在 ${name} 里登录，再点一次一键配置` };
