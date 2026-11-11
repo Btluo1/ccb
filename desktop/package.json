@@ -1,6 +1,6 @@
 {
   "name": "ccb-desktop",
-  "version": "1.0.29",
+  "version": "1.0.30",
   "description": "CCB - AI 编程助手一键配置工具",
   "main": "electron/main.js",
   "private": true,
@@ -28,7 +28,7 @@
       "renderer/**/*"
     ],
     "win": {
-      "icon": "build/icon.png",
+      "icon": "build/icon.ico",
       "target": [
         "nsis",
         "portable"
