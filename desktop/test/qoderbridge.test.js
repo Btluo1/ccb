@@ -554,6 +554,50 @@ describe('qoderbridge 真实 runtime 副本冒烟（未安装则跳过）', () =
 	}, 120000);
 });
 
+describe('qoderbridge 真实新版 runtime 冒烟（0.5.x，未安装则跳过）', () => {
+	it('0.5.x 文件：streamFrames 注入 → 幂等 → rollback 字节级往返', () => {
+		/* 与 QoderWork 冒烟同理：只操作临时副本，绝不触碰真实 runtime。
+		 * 快速判定：任一候选 runtime 含 async*streamFrames( 才跑本用例。 */
+		const client = { id: 'qoder-app-cn', appDirs: ['QoderCN'], exeNames: ['Qoder CN.exe'] };
+		const files = qb.findQoderWorkRuntimes(client, () => {});
+		const target = files.find((f) => {
+			try { return fs.readFileSync(f, 'utf8').includes('async*streamFrames('); } catch { return false; }
+		});
+		if (!target) return; /* 本机未装 0.5.x 新版客户端时跳过 */
+
+		/* 实机 runtime 可能已打过补丁（本机一键配置写过）：优先取原始备份，
+		 * 保证冒烟从干净态出发、rollback 期望为真正的原始字节 */
+		const srcFile = fs.existsSync(target + '.ccb.bak') ? target + '.ccb.bak' : target;
+		const src = fs.readFileSync(srcFile, 'utf8');
+		const sr = qb.extractStreamFramesPatch(src);
+		expect(sr.ok).toBe(true);
+
+		const tmp = path.join(tmpRoot, 'runtime-new.obf.mjs');
+		fs.writeFileSync(tmp, src);
+		expect(qb.patchQoderWorkRuntime(tmp, () => {})).toBe(true);
+		const patched = fs.readFileSync(tmp, 'utf8');
+
+		/* guard 紧跟 streamFrames 签名（参数名以提取值为准） */
+		const sig = `async*streamFrames(${sr.payloadVar},${sr.optsVar}){`;
+		const bi = patched.indexOf(sig);
+		expect(bi).toBeGreaterThan(0);
+		expect(patched.indexOf(qb.RBRIDGE_BEGIN)).toBe(bi + sig.length);
+		const guard = patched.slice(patched.indexOf(qb.RBRIDGE_BEGIN), patched.indexOf(qb.RBRIDGE_END));
+		expect(guard).toContain(`{yield*__ccbRemoteChat(${sr.payloadVar},${sr.optsVar});return;}`);
+		/* bridge 块在末尾且含远程桥函数 */
+		expect(patched.endsWith(qb.MARK_END)).toBe(true);
+		expect(patched).toContain('async function* __ccbRemoteChat(');
+		/* 备份恒为原始内容 */
+		expect(fs.readFileSync(tmp + '.ccb.bak', 'utf8')).toBe(src);
+
+		/* 幂等 + 回滚字节级还原 */
+		expect(qb.patchQoderWorkRuntime(tmp, () => {})).toBe(true);
+		expect(fs.readFileSync(tmp, 'utf8')).toBe(patched);
+		expect(qb.rollbackQoderWorkRuntime(tmp, () => {})).toBe(true);
+		expect(fs.readFileSync(tmp, 'utf8')).toBe(src);
+	}, 120000);
+});
+
 /* ---------- 桥函数（vm 隔离，mock fetch/SSE） ---------- */
 
 function sseResponse(chunks) {
@@ -834,5 +878,259 @@ describe('qoderbridge 桥函数 chunks 契约（Qoder CN SDK）', () => {
 		const viaIter = await collectChunks(r2.chunks);
 		expect(viaIter.length).toBe(2);
 		expect(viaIter[0].choices[0].delta.content).toBe('A');
+	});
+});
+
+/* ───── 新版 runtime（0.5.12+ Remote Chat，streamFrames 注入）─────
+ * 合成最小片段：h8t 类的 stream/streamFrames 方法对，字节形状与
+ * qoder-cn-agent-sdk 0.5.14 的关键段一致（streamFrames 为方法名，
+ * payload/opts 参数名为混淆名）。 */
+const NEW_RUNTIME_SAMPLE = [
+	'var h8t=class{constructor(A,e,t){this.pipeline=A,this.userInfoResolver=e,this.authResolver=t}',
+	'async*stream(A,e={}){try{for await(let t of this.streamFrames(A,e))yield t;}catch(t){throw t}}',
+	'async*streamFrames(A,e){let{signal:t}=e;if(t?.throwIfAborted(),0===A.session_id.trim().length)throw new Error("empty session_id");if(!A.stream)throw new Error("stream required");let i=JSON.stringify(A),r=Cr.builder().operation("inference.remoteChat.stream").body(i).withWasmInferSigningMeta({modelKey:A.model_config.key}).build(),s=await this.pipeline.execute(r);for await(let e of s.sse()){let n=e.data.trim();if(!n)continue;if("[DONE]"===n)break;yield JSON.parse(n)}}};',
+	'',
+].join('\n');
+
+/* 新版 payload 形状（qFr 产物，custom_model 由 ICa 构建） */
+function baseRemoteReq(over) {
+	return Object.assign({
+		request_id: 'req-1',
+		session_id: 'sess-1',
+		stream: true,
+		model_config: { key: 'custom_model', source: 'system', format: 'openai', api_key: '', url: '' },
+		custom_model: {
+			model: 'glm-5.3',
+			url: 'https://code.btluo.com/v1/chat/completions',
+			parameters: { api_key: 'sk-ccb-abc123' },
+		},
+		messages: [{ role: 'user', content: '你好' }],
+		tools: [{ type: 'function', function: { name: 'f', description: 'd', parameters: { type: 'object' } } }],
+		parameters: { temperature: 0.5, max_tokens: 1024, top_k: 40, reasoning_effort: 'none', context_length: 128000 },
+	}, over);
+}
+
+async function drainRemote(gen) {
+	const out = [];
+	for await (const c of gen) out.push(c);
+	return out;
+}
+
+describe('qoderbridge 新版 runtime 锚点提取（extractStreamFramesPatch）', () => {
+	it('提取 payload/opts 参数名与注入位置', () => {
+		const p = qb.extractStreamFramesPatch(NEW_RUNTIME_SAMPLE);
+		expect(p.ok).toBe(true);
+		expect(p.payloadVar).toBe('A');
+		expect(p.optsVar).toBe('e');
+		expect(NEW_RUNTIME_SAMPLE.slice(p.start, p.start + p.len)).toBe('async*streamFrames(A,e){');
+	});
+
+	it('支持其它混淆参数名（含 $）', () => {
+		const src = 'class X{async*streamFrames($q,$o){let{signal:t}=$o;yield 1}}';
+		const p = qb.extractStreamFramesPatch(src);
+		expect(p.ok).toBe(true);
+		expect(p.payloadVar).toBe('$q');
+		expect(p.optsVar).toBe('$o');
+	});
+
+	it('缺失时失败并带原因', () => {
+		expect(qb.extractStreamFramesPatch('export const x=1;').ok).toBe(false);
+	});
+
+	it('不唯一时失败（版本不兼容）', () => {
+		expect(qb.extractStreamFramesPatch(NEW_RUNTIME_SAMPLE + NEW_RUNTIME_SAMPLE).ok).toBe(false);
+	});
+});
+
+describe('qoderbridge 新版 runtime 补丁 / 回滚（合成 runtime 文件）', () => {
+	const log = () => {};
+
+	it('patch：streamFrames 顶部注入远程桥 guard，旧 span 全部缺席，幂等，备份为原始内容', () => {
+		const file = path.join(tmpRoot, 'new-runtime.obf.mjs');
+		fs.writeFileSync(file, NEW_RUNTIME_SAMPLE);
+		expect(qb.patchQoderWorkRuntime(file, log)).toBe(true);
+
+		const out = fs.readFileSync(file, 'utf8');
+		/* guard 紧跟 streamFrames 签名 { 之后，内容含 sk-ccb- 判定与 yield* 短路 */
+		const bi = out.indexOf('async*streamFrames(A,e){');
+		expect(out.indexOf(qb.RBRIDGE_BEGIN)).toBe(bi + 'async*streamFrames(A,e){'.length);
+		const guard = out.slice(out.indexOf(qb.RBRIDGE_BEGIN), out.indexOf(qb.RBRIDGE_END));
+		expect(guard).toContain('if(A&&A.custom_model&&A.custom_model.parameters');
+		expect(guard).toContain('api_key.indexOf("sk-ccb-")===0');
+		expect(guard).toContain('{yield*__ccbRemoteChat(A,e);return;}');
+		/* guard 之后原首语句原样保留 */
+		expect(out).toContain(qb.RBRIDGE_END + 'let{signal:t}=e;');
+		/* 新版 runtime：旧 span 一律不存在 */
+		expect(out).not.toContain(qb.GUARD_BEGIN);
+		expect(out).not.toContain(qb.PGUARD_MARK);
+		expect(out).not.toContain(qb.RGUARD_MARK);
+		expect(out).not.toContain(qb.TGUARD_MARK);
+		expect(out).not.toContain(qb.XGUARD_MARK);
+		/* bridge 块含远程桥函数 */
+		expect(out).toContain('function __ccbBodyR(');
+		expect(out).toContain('async function* __ccbRemoteChat(');
+		expect(out.endsWith(qb.MARK_END)).toBe(true);
+		/* 备份恒为原始内容 */
+		expect(fs.readFileSync(file + '.ccb.bak', 'utf8')).toBe(NEW_RUNTIME_SAMPLE);
+
+		/* 幂等：第二次 patch 内容不变 */
+		expect(qb.patchQoderWorkRuntime(file, log)).toBe(true);
+		expect(fs.readFileSync(file, 'utf8')).toBe(out);
+	});
+
+	it('patch：非 sk-ccb- 请求不短路——guard 之后原代码逐字节保留（静态）', () => {
+		const file = path.join(tmpRoot, 'new-runtime2.obf.mjs');
+		fs.writeFileSync(file, NEW_RUNTIME_SAMPLE);
+		qb.patchQoderWorkRuntime(file, log);
+		const out = fs.readFileSync(file, 'utf8');
+		/* guard 只是插在签名 { 之后：原 streamFrames 行的尾部原样保留 */
+		const tail = NEW_RUNTIME_SAMPLE.split('\n')[2].slice('async*streamFrames(A,e){'.length);
+		expect(out).toContain(qb.RBRIDGE_END + tail);
+	});
+
+	it('patch：新版 runtime 若重新出现 policy/reconcile/工厂/回写锚点则照常打上', () => {
+		const hybrid = [
+			NEW_RUNTIME_SAMPLE.split('\n')[0],
+			NEW_RUNTIME_SAMPLE.split('\n')[1],
+			NEW_RUNTIME_SAMPLE.split('\n')[2],
+			SAMPLE.split('\n')[2], /* JA policy guard 段 */
+			SAMPLE.split('\n')[3], /* reconcile 段 */
+			SAMPLE.split('\n')[4], /* 传输工厂段 */
+			SAMPLE.split('\n')[5], /* 目录回写段 */
+			'',
+		].join('\n');
+		const file = path.join(tmpRoot, 'hybrid.obf.mjs');
+		fs.writeFileSync(file, hybrid);
+		expect(qb.patchQoderWorkRuntime(file, log)).toBe(true);
+		const out = fs.readFileSync(file, 'utf8');
+		expect(out).toContain(qb.RBRIDGE_BEGIN);
+		expect(out).toContain(qb.PGUARD_MARK);
+		expect(out).toContain(qb.RGUARD_MARK);
+		expect(out).toContain(qb.TGUARD_MARK);
+		expect(out).toContain(qb.XGUARD_MARK);
+	});
+
+	it('rollback：从备份字节级还原；无备份时按标记精确剥离', () => {
+		const file = path.join(tmpRoot, 'rb1.obf.mjs');
+		fs.writeFileSync(file, NEW_RUNTIME_SAMPLE);
+		qb.patchQoderWorkRuntime(file, log);
+		expect(qb.rollbackQoderWorkRuntime(file, log)).toBe(true);
+		expect(fs.readFileSync(file, 'utf8')).toBe(NEW_RUNTIME_SAMPLE);
+
+		/* 无备份剥离：patch 后删掉备份再回滚 */
+		const file2 = path.join(tmpRoot, 'rb2.obf.mjs');
+		fs.writeFileSync(file2, NEW_RUNTIME_SAMPLE);
+		qb.patchQoderWorkRuntime(file2, log);
+		fs.rmSync(file2 + '.ccb.bak');
+		expect(qb.rollbackQoderWorkRuntime(file2, log)).toBe(true);
+		expect(fs.readFileSync(file2, 'utf8')).toBe(NEW_RUNTIME_SAMPLE);
+	});
+
+	it('两版锚点都缺失：fail-fast 报不兼容且文件不动', () => {
+		const file = path.join(tmpRoot, 'future.obf.mjs');
+		fs.writeFileSync(file, 'export const x=1;\n');
+		expect(() => qb.patchQoderWorkRuntime(file, log)).toThrow(/不兼容/);
+		expect(fs.readFileSync(file, 'utf8')).toBe('export const x=1;\n');
+		expect(fs.existsSync(file + '.ccb.bak')).toBe(false);
+	});
+});
+
+describe('qoderbridge 远程桥 __ccbRemoteChat（vm 隔离）', () => {
+	it('OpenAI body 映射（白名单参数 + reasoning_effort=none→thinking disabled）+ SSE chunk 透传', async () => {
+		const seen = [];
+		const ctx = makeCtx(async (url, opts) => {
+			seen.push({ url, auth: opts.headers.authorization, body: JSON.parse(opts.body), signal: opts.signal });
+			return sseResponse([
+				{ id: 'c1', choices: [{ index: 0, delta: { role: 'assistant', content: '回复' } }] },
+				{ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
+			]);
+		});
+		const req = baseRemoteReq({
+			messages: [
+				{ role: 'system', content: '你是助手' },
+				{ role: 'user', content: [{ type: 'text', text: '看图' }, { type: 'image_url', image_url: { url: 'http://x/y.png' } }] },
+				{ role: 'assistant', content: '前回复', tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{"x":1}' } }] },
+				{ role: 'tool', tool_call_id: 't1', content: '结果' },
+			],
+		});
+		const chunks = await drainRemote(ctx.__ccbRemoteChat(req, {}));
+		/* fetch 请求映射：OpenAI 形状直传，非白名单参数（top_k/context_length）不落键 */
+		expect(seen.length).toBe(1);
+		expect(seen[0].url).toBe('https://code.btluo.com/v1/chat/completions');
+		expect(seen[0].auth).toBe('Bearer sk-ccb-abc123');
+		const b = seen[0].body;
+		expect(b.model).toBe('glm-5.3');
+		expect(b.stream).toBe(true);
+		expect(b.stream_options).toEqual({ include_usage: true });
+		expect(b.temperature).toBe(0.5);
+		expect(b.max_tokens).toBe(1024);
+		expect('top_k' in b).toBe(false);
+		expect('context_length' in b).toBe(false);
+		expect(b.thinking).toEqual({ type: 'disabled' });
+		expect(b.tools).toEqual([{ type: 'function', function: { name: 'f', description: 'd', parameters: { type: 'object' } } }]);
+		expect(b.messages).toEqual(req.messages);
+		/* SSE chunk 原样 yield（zFr.accept 直接消费） */
+		expect(chunks).toEqual([
+			{ id: 'c1', choices: [{ index: 0, delta: { role: 'assistant', content: '回复' } }] },
+			{ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
+		]);
+	});
+
+	it('reasoning_effort 非 none 时不传 thinking；参数缺省不落键', async () => {
+		const seen = [];
+		const ctx = makeCtx(async (u, o) => { seen.push(JSON.parse(o.body)); return sseResponse([]); });
+		await drainRemote(ctx.__ccbRemoteChat(baseRemoteReq({ parameters: {} }), {}));
+		const b = seen[0];
+		expect(b.thinking).toBeUndefined();
+		expect('temperature' in b).toBe(false);
+		expect('max_tokens' in b).toBe(false);
+		await drainRemote(ctx.__ccbRemoteChat(baseRemoteReq({ parameters: { reasoning_effort: 'high' } }), {}));
+		expect(seen[1].thinking).toBeUndefined();
+	});
+
+	it('非流式 JSON 响应兜底：合成 delta+finish 两块（含 tool_calls）', async () => {
+		const ctx = makeCtx(async () => ({
+			ok: true, status: 200,
+			headers: { get: () => 'application/json' },
+			text: async () => JSON.stringify({
+				id: 'j1', model: 'glm-5.3',
+				choices: [{
+					index: 0,
+					message: { role: 'assistant', content: '答案', tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+					finish_reason: 'tool_calls',
+				}],
+				usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+			}),
+		}));
+		const chunks = await drainRemote(ctx.__ccbRemoteChat(baseRemoteReq({}), {}));
+		expect(chunks.length).toBe(3);
+		expect(chunks[0].choices[0].delta).toEqual({ role: 'assistant', content: '答案' });
+		expect(chunks[1].choices[0].delta.tool_calls).toEqual([
+			{ index: 0, id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } },
+		]);
+		expect(chunks[2].choices[0]).toEqual({ index: 0, delta: {}, finish_reason: 'tool_calls' });
+		expect(chunks[2].usage).toEqual({ prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 });
+	});
+
+	it('HTTP 错误：迭代器 reject（CCB HTTP 状态码+响应体）', async () => {
+		const ctx = makeCtx(async () => ({
+			ok: false, status: 401,
+			headers: { get: () => 'application/json' },
+			text: async () => '{"error":"Invalid key"}',
+		}));
+		await expect(drainRemote(ctx.__ccbRemoteChat(baseRemoteReq({}), {}))).rejects.toThrow(/CCB HTTP 401.*Invalid key/s);
+	});
+
+	it('url 缺失：reject 而非挂起；base url 补全 /chat/completions；signal 透传到 fetch', async () => {
+		const seen = [];
+		const ctx = makeCtx(async (u, o) => { seen.push({ url: u, signal: o.signal }); return sseResponse([]); });
+		const ac = new AbortController();
+		await expect(drainRemote(ctx.__ccbRemoteChat(baseRemoteReq({ custom_model: { model: 'm', url: '', parameters: { api_key: 'sk-ccb-x' } } }), {})))
+			.rejects.toThrow(/missing custom model url/);
+		/* url 缺失在 fetch 前就抛：seen[0] 是补全 url 那次调用 */
+		await drainRemote(ctx.__ccbRemoteChat(baseRemoteReq({ custom_model: { model: 'm', url: 'https://relay.example/v1', parameters: { api_key: 'sk-ccb-x' } } }), { signal: ac.signal }));
+		expect(seen.length).toBe(1);
+		expect(seen[0].url).toBe('https://relay.example/v1/chat/completions');
+		expect(seen[0].signal).toBe(ac.signal);
 	});
 });

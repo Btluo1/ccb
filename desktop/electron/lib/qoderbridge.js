@@ -61,6 +61,28 @@
  *   - worker 主进程启动即设 NODE_TLS_REJECT_UNAUTHORIZED="0"，无需处理证书问题
  *     （我们也不做 MITM，直连 https）。
  *
+ * ─── 2026-11-18：新版 worker（qoder-cn-agent-sdk，Qoder CN 0.5.12+ fast-update）───
+ * 客户端 fast-update 把 worker runtime 整体重构（35MB，实测 0.5.12/0.5.13/0.5.14），
+ * 旧锚点全部消失：bodyKind / ChatCompletionStream / openCall / getDefaultModel /
+ * 传输工厂（case"grpc" 只剩 OpenTelemetry 的）均不复存在。逆向结论：
+ *   - 聊天不再走 grpc-js，改为「签名 HTTP 管道」：h8t.streamFrames 把请求体
+ *     JSON.stringify 后经 Cr.builder().operation("inference.remoteChat.stream")
+ *     …withWasmInferSigningMeta(...) 发给网关（WASM 签名，外部无法复刻，网络层
+ *     短路方案作废）；
+ *   - 请求体仍含 custom_model 字段（ICa 构建：{model, parameters:{api_key}, url?,
+ *     style?}），且 messages/tools/parameters 已是 OpenAI 兼容形状（wCa/vCa/MCa）；
+ *   - 响应消费方 zFr.accept 直接吃 OpenAI chunk（choices[0].delta / finish_reason /
+ *     usage，error 字段抛错）——Hca 计量器与 qCa 归一化器照常工作。
+ * 新方案：在 streamFrames 顶部注入 guard——payload 的 custom_model.parameters.api_key
+ * 以 sk-ccb- 开头时 `yield* __ccbRemoteChat(A,e)` 短路（fetch customModel.url 的
+ * OpenAI SSE 并逐 chunk yield），其余请求原样透传。锚点 `async*streamFrames(` 的
+ * streamFrames 是方法名（this.streamFrames 调用点同名），混淆器不改属性名，稳定。
+ * 旧版补丁（policy 门禁 / reconcile / 传输工厂 / 目录回写）的锚点在新版全部缺失：
+ * 新版 worker 不再经 subtype:"get_model_policy" 咨询主进程、默认模型解析已重构、
+ * .models/default 回写缓存已移除——按「缺失即跳过」处理并记日志，不再 fail-fast。
+ * 两代 runtime 由锚点自动识别：有 bodyKind:"req" 走旧链路，有 async*streamFrames(
+ * 走新链路，两者都没有才报不兼容。
+ *
  * 回滚：优先还原 .ccb.bak（恒为首次写入前的原始状态）；无备份时按标记精确剥离
  * guard 与桥函数块。注意：若 QoderWork 升级后回滚，旧备份可能不再匹配新版本
  * runtime，此时应以「重新写入配置」代替回滚（日志有提示）。
@@ -80,6 +102,15 @@ const GUARD_END = '/*__CCB_QW_GUARD_E__*/';
 const CCB_KEY_PREFIX = 'sk-ccb-';
 const BACKUP_SUFFIX = '.ccb.bak';
 const ANCHOR = 'bodyKind:"req"';
+
+/* 新版（0.5.12+ Remote Chat）桥：streamFrames 顶部注入的 BYOK 短路 guard。
+ * streamFrames 是类方法名（h8t 内 this.streamFrames 调用点同名），混淆器不改
+ * 属性名；参数名（payload/opts）会变，按正则提取。标记剥离即还原。 */
+const BRIDGE_FN_REMOTE = '__ccbRemoteChat';
+const RBRIDGE_BEGIN = '/*__CCB_QW_RB__*/';
+const RBRIDGE_END = '/*__CCB_QW_RE__*/';
+const RBRIDGE_RE = /\/\*__CCB_QW_RB__\*\/[\s\S]*?\/\*__CCB_QW_RE__\*\//g;
+const STREAMFN_RE = /async\*streamFrames\(([\w$]+),([\w$]+)\)\{/g;
 
 /* 策略门禁（get_model_policy）补丁：
  * 锚点是 worker 里唯一的 get_model_policy 字面量（JA 回调体内 createRequest 处），
@@ -189,6 +220,12 @@ function bridgeSource() {
 		'pump();}',
 		'function __ccbRun(u,k,A,c,sig){fetch(u,{method:"POST",headers:{"content-type":"application/json","authorization":"Bearer "+k},body:JSON.stringify(__ccbBody(A)),signal:sig}).then(function(res){if(!res.ok){res.text().then(function(t){c.__emit("error",new Error("CCB HTTP "+res.status+(t?": "+t.slice(0,600):"")));},function(){c.__emit("error",new Error("CCB HTTP "+res.status));});return;}var ct=(res.headers.get("content-type")||"")+"";if(ct.indexOf("event-stream")<0){res.text().then(function(t){try{var j=JSON.parse(t);var id=j.id||A.requestId||"";var ts=Math.floor(Date.now()/1e3);var md=j.model||"";var ch=(j.choices&&j.choices[0])||null;var mg=ch?(ch.message||null):null;if(mg){var d={role:"assistant"};if(mg.content!=null)d.content=mg.content;if(mg.tool_calls)d.tool_calls=__ccbTcs(mg.tool_calls);c.__emit("data",{id:id,object:"chat.completion.chunk",created:ts,model:md,choices:[{index:0,delta:d,finish_reason:null}]});c.__emit("data",{id:id,object:"chat.completion.chunk",created:ts,model:md,choices:[{index:0,delta:{},finish_reason:(ch&&ch.finish_reason)||"stop"}],usage:j.usage});}c.__emit("end");}catch(e){c.__emit("error",e);}},function(e){c.__emit("error",e);});return;}__ccbSse(res,c);},function(e){c.__emit("error",e);});}',
 		'function ' + BRIDGE_FN + '(A){var cm=(A&&A.customModel)||{};var u=cm.url||"";var k=(cm.parameters&&cm.parameters.api_key)||"";var c=__ccbMkCall();var ac=new AbortController();if(A&&A.signal){if(A.signal.aborted)ac.abort();else A.signal.addEventListener("abort",function(){try{ac.abort();}catch(e){}});}c.cancel=function(){try{ac.abort();}catch(e){}};c.__emit("metadata",{get:function(){return[];}});var ret={call:c,requestId:(A&&A.requestId)||"",serverRequestId:null,chunks:__ccbChunks(c),execution:{reportStreamHealth:function(){}},finishRouteLifecycle:function(){try{ac.abort();}catch(e){}}};if(!u){c.__emit("error",new Error("CCB bridge: missing custom model url"));return Promise.resolve(ret);}if(u.indexOf("/chat/completions")<0)u=u.replace(/\\/+$/,"")+"/chat/completions";__ccbRun(u,k,A,c,ac.signal);return Promise.resolve(ret);}',
+		/* ── 新版（0.5.12+ Remote Chat）桥：payload 已是 OpenAI 形状（wCa/vCa/MCa），
+		 *      仅做参数白名单映射；SSE 逐 chunk yield 给 zFr.accept 消费 ── */
+		'function __ccbBodyR(A){var cm=A.custom_model||{};var b={};b.model=cm.model;b.messages=A.messages||[];if(A.tools&&A.tools.length>0)b.tools=A.tools;b.stream=true;b.stream_options={include_usage:true};var p=A.parameters||{};if(p.temperature!=null)b.temperature=p.temperature;if(p.max_tokens!=null)b.max_tokens=p.max_tokens;if(p.top_p!=null)b.top_p=p.top_p;if(p.stop!=null)b.stop=p.stop;if(p.tool_choice!=null)b.tool_choice=p.tool_choice;if(p.reasoning_effort==="none")b.thinking={type:"disabled"};return b;}',
+		'function __ccbLineR(s,out){if(s.length>0&&s.charCodeAt(s.length-1)===13)s=s.slice(0,s.length-1);if(s.indexOf("data:")!==0)return false;var p=s.slice(5).trim();if(!p)return false;if(p==="[DONE]")return true;try{out.push(JSON.parse(p));}catch(e){}return false;}',
+		'function __ccbNonSseR(j,A){var ch=(j&&j.choices&&j.choices[0])||null;var mg=ch?ch.message:null;if(!mg)return[j];var ts=Math.floor(Date.now()/1e3);var mid=(j&&j.id)||(A&&A.request_id)||"";var md=(j&&j.model)||"";var o=[];if(mg.content!=null||mg.reasoning_content){o.push({id:mid,object:"chat.completion.chunk",created:ts,model:md,choices:[{index:0,delta:{role:"assistant",content:mg.content!=null?mg.content:(mg.reasoning_content||"")},finish_reason:null}],usage:j.usage});}if(mg.tool_calls&&mg.tool_calls.length>0){var tc=[];for(var i=0;i<mg.tool_calls.length;i++){var x=mg.tool_calls[i]||{};var f=x.function||{};tc.push({index:i,id:x.id||x.call_id||"",type:"function",function:{name:f.name||"",arguments:typeof f.arguments==="string"?f.arguments:(f.arguments==null?"":JSON.stringify(f.arguments))}});}o.push({id:mid,object:"chat.completion.chunk",created:ts,model:md,choices:[{index:0,delta:{role:"assistant",tool_calls:tc},finish_reason:null}],usage:j.usage});}o.push({id:mid,object:"chat.completion.chunk",created:ts,model:md,choices:[{index:0,delta:{},finish_reason:(ch&&ch.finish_reason)||"stop"}],usage:j.usage});return o;}',
+		'async function* ' + BRIDGE_FN_REMOTE + '(A,e){var cm=A.custom_model||{};var u=cm.url||"";var k=(cm.parameters&&cm.parameters.api_key)||"";if(!u)throw new Error("CCB bridge: missing custom model url");if(u.indexOf("/chat/completions")<0)u=u.replace(/\\/+$/,"")+"/chat/completions";var sig=e&&e.signal;var res=await fetch(u,{method:"POST",headers:{"content-type":"application/json","authorization":"Bearer "+k},body:JSON.stringify(__ccbBodyR(A)),signal:sig});if(!res.ok){var t="";try{t=await res.text();}catch(e0){}throw new Error("CCB HTTP "+res.status+(t?": "+t.slice(0,600):""));}var ct=(res.headers.get("content-type")||"")+"";if(ct.indexOf("event-stream")<0){var txt=await res.text();var j=null;try{j=JSON.parse(txt);}catch(e1){}if(!j)throw new Error("CCB bridge: non-JSON non-SSE response");var synth=__ccbNonSseR(j,A);for(var s1=0;s1<synth.length;s1++)yield synth[s1];return;}var rd=res.body.getReader();var dec=new TextDecoder();var buf="";for(;;){var m=await rd.read();if(m.done)break;buf+=dec.decode(m.value,{stream:true});var ls=buf.split("\\n");buf=ls.pop();var stop=false;for(var i=0;i<ls.length;i++){var arr=[];if(__ccbLineR(ls[i],arr))stop=true;for(var j2=0;j2<arr.length;j2++)yield arr[j2];}if(stop)return;}if(buf){var arr2=[];__ccbLineR(buf,arr2);for(var j3=0;j3<arr2.length;j3++)yield arr2[j3];}}',
 		MARK_END,
 	].join('\n');
 }
@@ -239,7 +276,10 @@ function stripBridge(src) {
 	if (b < 0) return src;
 	const e = src.indexOf(MARK_END, b);
 	if (e < 0) return src.slice(0, b);
-	return src.slice(0, b) + src.slice(e + MARK_END.length);
+	/* upsertBridge 恒以 src + '\n' + bs 追加：剥标记时连同这一个换行一起吃掉，
+	 * 无备份剥离才能字节级还原（否则残留一个尾部空行） */
+	const s = b > 0 && src[b - 1] === '\n' ? b - 1 : b;
+	return src.slice(0, s) + src.slice(e + MARK_END.length);
 }
 
 /** 追加或整体替换 bridge 标记块（无条件替换为当前源码，实现幂等更新） */
@@ -250,6 +290,42 @@ function upsertBridge(src) {
 	const e = src.indexOf(MARK_END, b);
 	if (e < 0) return src.slice(0, b) + bs; /* 有头无尾的残块：从头整体重写 */
 	return src.slice(0, b) + bs + src.slice(e + MARK_END.length);
+}
+
+/* ---------- 新版 Remote Chat 桥（streamFrames 注入，0.5.12+） ---------- */
+
+/** 提取 streamFrames 入口的形状与参数名（全文件唯一，不唯一=不兼容）。
+ *  streamFrames 是 h8t 的方法名（this.streamFrames 调用点同名，混淆器不改），
+ *  参数名（payload/opts）按捕获组提取，不写死。 */
+function extractStreamFramesPatch(src) {
+	const matches = [...src.matchAll(STREAMFN_RE)];
+	if (!matches.length) {
+		return { ok: false, reason: '未找到 streamFrames 入口（async*streamFrames(...)）' };
+	}
+	if (matches.length > 1) return { ok: false, reason: 'streamFrames 入口不唯一' };
+	const m = matches[0];
+	return { ok: true, start: m.index, len: m[0].length, payloadVar: m[1], optsVar: m[2] };
+}
+
+/** streamFrames 顶部 guard 源码：命中 sk-ccb- 密钥的 BYOK 请求时短路到远程桥 */
+function remoteGuardSource(p) {
+	const v = p.payloadVar;
+	return RBRIDGE_BEGIN
+		+ 'if(' + v + '&&' + v + '.custom_model&&' + v + '.custom_model.parameters'
+		+ '&&typeof ' + v + '.custom_model.parameters.api_key=="string"'
+		+ '&&' + v + '.custom_model.parameters.api_key.indexOf("' + CCB_KEY_PREFIX + '")===0)'
+		+ '{yield*' + BRIDGE_FN_REMOTE + '(' + v + ',' + p.optsVar + ');return;}'
+		+ RBRIDGE_END;
+}
+
+/** 按远程桥标记剥离（无标记返回原串） */
+function stripRemoteGuard(src) {
+	return src.replace(RBRIDGE_RE, '');
+}
+
+/** 应用 streamFrames guard（纯函数）：插在签名 { 之后、原首语句之前 */
+function applyStreamFramesPatch(src, p) {
+	return src.slice(0, p.start + p.len) + remoteGuardSource(p) + src.slice(p.start + p.len);
 }
 
 /* ---------- 策略门禁跳过（get_model_policy） ---------- */
@@ -679,7 +755,8 @@ function patchQoderWorkRuntime(file, log) {
 	const src = fs.readFileSync(file, 'utf8');
 	const hadAny = src.indexOf(MARK_BEGIN) >= 0 || src.indexOf(GUARD_BEGIN) >= 0
 		|| src.indexOf(PGUARD_MARK) >= 0 || src.indexOf(RGUARD_MARK) >= 0
-		|| src.indexOf(TGUARD_MARK) >= 0 || src.indexOf(XGUARD_MARK) >= 0;
+		|| src.indexOf(TGUARD_MARK) >= 0 || src.indexOf(XGUARD_MARK) >= 0
+		|| src.indexOf(RBRIDGE_BEGIN) >= 0;
 	let out = src;
 	/* 幂等更新：先剥离旧 span，保证各锚点形状可重新提取。
 	 * guard 也必须参与幂等：旧版「GUARD_BEGIN 存在即跳过」会让 CCB 升级 guardSource
@@ -688,59 +765,114 @@ function patchQoderWorkRuntime(file, log) {
 	if (src.indexOf(RGUARD_MARK) >= 0) out = stripReconcileGuard(out);
 	if (src.indexOf(TGUARD_MARK) >= 0) out = stripFactoryWrapper(out);
 	if (src.indexOf(XGUARD_MARK) >= 0) out = stripXlGuard(out);
+	if (src.indexOf(RBRIDGE_BEGIN) >= 0) out = stripRemoteGuard(out);
 	if (src.indexOf(GUARD_BEGIN) >= 0) out = stripGuard(out);
-	{
-		const a = extractAnchor(out);
-		if (!a.ok) {
-			throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${a.reason}），已中止且未修改文件`);
+	/* 两代 runtime 自动识别：新版（0.5.12+ Remote Chat，无 gRPC openCall）走 streamFrames
+	 * 注入；旧版走 bodyKind openCall guard + 传输工厂链路。 */
+	const isNewRuntime = extractStreamFramesPatch(out).ok;
+	if (isNewRuntime) {
+		const sr = extractStreamFramesPatch(out);
+		out = applyStreamFramesPatch(out, sr);
+		log('已定位新版 worker 的 remoteChat streamFrames 入口，注入 BYOK 直连桥（Remote Chat）…');
+		/* 策略门禁：新版 worker 已无 subtype:"get_model_policy" 咨询（锚点消失）；
+		 * 若未来版本重新引入同形状锚点则照常打补丁。形状异常才视为不兼容。 */
+		const pa = extractPolicyGuard(out);
+		if (!pa.ok) {
+			if (!pa.absent) {
+				throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${pa.reason}），已中止且未修改文件`);
+			}
+			log('新版 runtime 无 get_model_policy 门禁锚点，无需策略跳过补丁。');
+		} else {
+			out = out.slice(0, pa.start) + policyGuardSource(pa.varName) + out.slice(pa.start + pa.len);
 		}
-		out = out.slice(0, a.insertPos) + guardSource(a.varName) + out.slice(a.insertPos);
-	}
-	/* 策略门禁跳过：有门禁就打（锚点缺失=无门禁，正常跳过）；形状异常=不兼容，fail-fast */
-	const pa = extractPolicyGuard(out);
-	if (!pa.ok) {
-		if (!pa.absent) {
-			throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${pa.reason}），已中止且未修改文件`);
+		/* 默认模型 reconcile / 传输工厂 / 目录回写：新版架构已重构或移除（实测 0.5.14
+		 * 全部无锚点），缺失按跳过处理并记日志，不再视为不兼容。 */
+		const rp = extractReconcilePatch(out);
+		if (rp.ok) {
+			const ro = applyReconcilePatch(out, rp);
+			if (ro === null) {
+				throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（reconcile try 体形状异常），已中止且未修改文件');
+			}
+			out = ro;
+		} else {
+			log('新版 runtime 已重构默认模型解析（无 reconcile 锚点），跳过 reconcile 补丁。');
 		}
-		log('该 runtime 无 get_model_policy 门禁，无需策略跳过补丁。');
+		const tp = extractFactoryPatch(out);
+		if (tp.ok) {
+			const to = applyFactoryWrapper(out, tp);
+			if (to === null) {
+				throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（传输工厂尾部形状异常），已中止且未修改文件');
+			}
+			out = to;
+		} else {
+			log('新版 runtime 已移除模型传输工厂（统一签名 HTTP 管道），跳过传输路由补丁。');
+		}
+		const xp = extractXlPatch(out);
+		if (xp.ok) {
+			if (xp.type === 'qw' && rp.ok) xp.cacheFn = rp.cacheFn;
+			const xo = applyXlPatch(out, xp);
+			if (xo === null) {
+				throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（目录同步回写形状异常），已中止且未修改文件');
+			}
+			out = xo;
+		} else {
+			log('新版 runtime 已移除默认模型回写缓存，跳过回写保护补丁。');
+		}
 	} else {
-		out = out.slice(0, pa.start) + policyGuardSource(pa.varName) + out.slice(pa.start + pa.len);
-	}
-	/* 默认模型 reconcile：BYOK 不传 --model，没有此补丁默认模型永远解析回平台目录默认 */
-	const rp = extractReconcilePatch(out);
-	if (!rp.ok) {
-		throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${rp.reason}），已中止且未修改文件`);
-	}
-	const ro = applyReconcilePatch(out, rp);
-	if (ro === null) {
-		throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（reconcile try 体形状异常），已中止且未修改文件');
-	}
-	out = ro;
-	/* 传输路由：legacy/http 传输下 BYOK 请求直发网关，guard 永不触发，必须改道 gRPC */
-	const tp = extractFactoryPatch(out);
-	if (!tp.ok) {
-		throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${tp.reason}），已中止且未修改文件`);
-	}
-	const to = applyFactoryWrapper(out, tp);
-	if (to === null) {
-		throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（传输工厂尾部形状异常），已中止且未修改文件');
-	}
-	out = to;
-	/* 目录同步回写保护：不修则启动/刷新即把默认模型踩回平台默认，前面所有补丁白做。
-	 * QoderWork 是 Xme({key:this.getDefaultModel...}) call-site；Qoder CN 是独立的
-	 * writeDefaultModelCache 函数（l$A）。extractXlPatch 自动识别两者，缺失才跳过。 */
-	const xp = extractXlPatch(out);
-	if (!xp.ok) {
-		/* 回写保护缺失会让启动/刷新把默认模型踩回平台默认——用户感知是「配置成功
-		 * 却没效果」，必须醒目告警并给出可操作指引，而不是一条普通提示 */
-		log(`警告：未匹配到目录同步回写段（${xp.reason}），回写保护补丁未生效。客户端版本可能已与当前 CCB 不兼容，默认模型可能被重置回平台默认；请更新 CCB 后重新写入配置。`);
-	} else {
-		if (xp.type === 'qw') xp.cacheFn = rp.cacheFn; /* QoderWork：缓存读取函数与 reconcile 同源 */
-		const xo = applyXlPatch(out, xp);
-		if (xo === null) {
-			throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（目录同步回写形状异常），已中止且未修改文件');
+		/* 旧版（≤1.0.45 gRPC openCall）：原链路，锚点缺失仍 fail-fast */
+		{
+			const a = extractAnchor(out);
+			if (!a.ok) {
+				throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${a.reason}），已中止且未修改文件。请更新 CCB 后重试。`);
+			}
+			out = out.slice(0, a.insertPos) + guardSource(a.varName) + out.slice(a.insertPos);
 		}
-		out = xo;
+		/* 策略门禁跳过：有门禁就打（锚点缺失=无门禁，正常跳过）；形状异常=不兼容，fail-fast */
+		const pa = extractPolicyGuard(out);
+		if (!pa.ok) {
+			if (!pa.absent) {
+				throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${pa.reason}），已中止且未修改文件`);
+			}
+			log('该 runtime 无 get_model_policy 门禁，无需策略跳过补丁。');
+		} else {
+			out = out.slice(0, pa.start) + policyGuardSource(pa.varName) + out.slice(pa.start + pa.len);
+		}
+		/* 默认模型 reconcile：BYOK 不传 --model，没有此补丁默认模型永远解析回平台目录默认 */
+		const rp = extractReconcilePatch(out);
+		if (!rp.ok) {
+			throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${rp.reason}），已中止且未修改文件`);
+		}
+		const ro = applyReconcilePatch(out, rp);
+		if (ro === null) {
+			throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（reconcile try 体形状异常），已中止且未修改文件');
+		}
+		out = ro;
+		/* 传输路由：legacy/http 传输下 BYOK 请求直发网关，guard 永不触发，必须改道 gRPC */
+		const tp = extractFactoryPatch(out);
+		if (!tp.ok) {
+			throw new Error(`QoderWork runtime 与当前 CCB 版本不兼容（${tp.reason}），已中止且未修改文件`);
+		}
+		const to = applyFactoryWrapper(out, tp);
+		if (to === null) {
+			throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（传输工厂尾部形状异常），已中止且未修改文件');
+		}
+		out = to;
+		/* 目录同步回写保护：不修则启动/刷新即把默认模型踩回平台默认，前面所有补丁白做。
+		 * QoderWork 是 Xme({key:this.getDefaultModel...}) call-site；Qoder CN 是独立的
+		 * writeDefaultModelCache 函数（l$A）。extractXlPatch 自动识别两者，缺失才跳过。 */
+		const xp = extractXlPatch(out);
+		if (!xp.ok) {
+			/* 回写保护缺失会让启动/刷新把默认模型踩回平台默认——用户感知是「配置成功
+			 * 却没效果」，必须醒目告警并给出可操作指引，而不是一条普通提示 */
+			log(`警告：未匹配到目录同步回写段（${xp.reason}），回写保护补丁未生效。客户端版本可能已与当前 CCB 不兼容，默认模型可能被重置回平台默认；请更新 CCB 后重新写入配置。`);
+		} else {
+			if (xp.type === 'qw') xp.cacheFn = rp.cacheFn; /* QoderWork：缓存读取函数与 reconcile 同源 */
+			const xo = applyXlPatch(out, xp);
+			if (xo === null) {
+				throw new Error('QoderWork runtime 与当前 CCB 版本不兼容（目录同步回写形状异常），已中止且未修改文件');
+			}
+			out = xo;
+		}
 	}
 	out = upsertBridge(out);
 	if (out === src) {
@@ -768,7 +900,7 @@ function patchQoderWorkRuntime(file, log) {
 	syncFastUpdateManifest(file, log);
 	log(hadAny
 		? 'QoderWork runtime 补丁已更新（BYOK 直连桥 + 策略门禁跳过 + 默认模型 reconcile + 传输路由 + 回写保护）。'
-		: `QoderWork runtime 补丁已写入（备份 ${path.basename(bak)}）：CCB 模型请求直连中转并跳过服务端自定义模型门禁，官方模型不受影响。`);
+		: `QoderWork runtime 补丁已写入（备份 ${path.basename(bak)}）：CCB 模型请求直连中转，官方模型不受影响。`);
 	return true;
 }
 
@@ -786,7 +918,8 @@ function rollbackQoderWorkRuntime(file, log) {
 		const patched =
 			cur.indexOf(MARK_BEGIN) >= 0 || cur.indexOf(GUARD_BEGIN) >= 0 ||
 			cur.indexOf(PGUARD_MARK) >= 0 || cur.indexOf(RGUARD_MARK) >= 0 ||
-			cur.indexOf(TGUARD_MARK) >= 0 || cur.indexOf(XGUARD_MARK) >= 0;
+			cur.indexOf(TGUARD_MARK) >= 0 || cur.indexOf(XGUARD_MARK) >= 0 ||
+			cur.indexOf(RBRIDGE_BEGIN) >= 0;
 		if (patched) {
 			withWriteGuard(() => {
 				const tmp = file + '.ccb-tmp';
@@ -806,6 +939,7 @@ function rollbackQoderWorkRuntime(file, log) {
 	out = stripReconcileGuard(out);
 	out = stripFactoryWrapper(out);
 	out = stripXlGuard(out);
+	out = stripRemoteGuard(out);
 	out = stripBridge(out);
 	if (out === src) return false;
 	withWriteGuard(() => atomicWriteFile(file, out), file);
@@ -868,11 +1002,13 @@ module.exports = {
 	CCB_KEY_PREFIX, CCB_MODEL_PREFIX, MARK_BEGIN, MARK_END, GUARD_BEGIN, GUARD_END, BACKUP_SUFFIX,
 	POLICY_ANCHOR, PGUARD_MARK, PGUARD_END,
 	RGUARD_MARK, RGUARD_END, TGUARD_MARK, TGUARD_END, XGUARD_MARK, XGUARD_END,
+	RBRIDGE_BEGIN, RBRIDGE_END, BRIDGE_FN_REMOTE,
 	bridgeSource, extractAnchor, guardSource, stripGuard, stripBridge,
 	extractPolicyGuard, policyGuardSource, stripPolicyGuard,
 	extractReconcilePatch, reconcileSpanSource, stripReconcileGuard, applyReconcilePatch,
 	extractFactoryPatch, factoryWrapperSource, stripFactoryWrapper, applyFactoryWrapper,
 	extractXlPatch, xlSpanSource, stripXlGuard, applyXlPatch,
+	extractStreamFramesPatch, remoteGuardSource, stripRemoteGuard, applyStreamFramesPatch,
 	SDK_PACKAGES, WORKER_RELPATH, VERSIONS_DIR, LOG_NAMES,
 	findQoderWorkRuntime, findQoderWorkRuntimes, runtimeCandidatesIn, sdkWorkerPaths,
 	listVersionDirs, cmpVersion, runtimesFromLogs,

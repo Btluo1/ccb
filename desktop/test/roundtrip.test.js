@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { createRequire } from 'node:module';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 
 /* 用 Node 原生 require 载入被测模块：保证测试与 writers.js 内部引用的是同一个
  * clients 模块实例，这样 patchClient 改动 CLIENTS 才能被 applyConfig 看到。 */
@@ -1066,6 +1066,13 @@ describe('Qoder CN 桌面版写入（settings.json + 加密 customs）', () => {
 
 	const readCustoms = async () => JSON.parse(await qoderDecrypt(fs.readFileSync(customsFile, 'utf8'), MACHINE_ID));
 
+	/* 桥接关闭：patchClient 会把 exeNames 换成不存在的进程名（见 patchClient 注释），
+	 * runtime 探测（exe + SDK 日志兜底）在本机必然落空，ensureQoderWorkBridge 会以
+	 * 「未定位到 worker runtime」失败——格式类用例只验证 settings/customs/默认模型
+	 * 的写入与回读，桥接由 qoderbridge.test.js（含真实 runtime 冒烟）专测覆盖。 */
+	const savedBridge = process.env.CCB_QW_BRIDGE;
+	process.env.CCB_QW_BRIDGE = 'off';
+
 	beforeEach(() => {
 		cleanTmp();
 		guard = realSnapshot();
@@ -1080,6 +1087,10 @@ describe('Qoder CN 桌面版写入（settings.json + 加密 customs）', () => {
 		restore();
 		expect(realSnapshot()).toBe(guard);
 		cleanTmp();
+	});
+	afterAll(() => {
+		if (savedBridge === undefined) delete process.env.CCB_QW_BRIDGE;
+		else process.env.CCB_QW_BRIDGE = savedBridge;
 	});
 
 	it('写入 settings.json 的自定义模型与加密 customs，保留用户原有数据', async () => {

@@ -350,9 +350,11 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 		for (const id of Object.keys(READERS)) {
 			it(`${id}：写入配置后，按客户端方式读回凭据可完成一次真实对话`, async () => {
 				const restore = patchClient(id, PATCHES[id]);
-				/* QoderWork 桥接与真实 runtime 强相关，格式闭环里显式跳过（另有 qoderbridge 专测） */
-				const savedBridge = id === 'qoderwork-cn' ? process.env.CCB_QW_BRIDGE : undefined;
-				if (id === 'qoderwork-cn') process.env.CCB_QW_BRIDGE = 'off';
+				/* QoderWork / Qoder CN 桌面版桥接与真实 runtime 强相关（patchClient 换掉 exeNames
+				 * 后探测必然落空），格式闭环里显式跳过（另有 qoderbridge 专测） */
+				const bridgeOff = id === 'qoderwork-cn' || id === 'qoder-app-cn';
+				const savedBridge = bridgeOff ? process.env.CCB_QW_BRIDGE : undefined;
+				if (bridgeOff) process.env.CCB_QW_BRIDGE = 'off';
 				try {
 				seedClient(id);
 				const c = cfg();
@@ -395,7 +397,7 @@ describe('一键配置 → 对话 完整链路（本地 mock 中转站）', () =
 				expect(relayRequests[0].body.model).toBe(c.defaultModel);
 				expect(d.userText(relayRequests[0].body)).toBe('你好，请回复确认。');
 			} finally {
-				if (id === 'qoderwork-cn') {
+				if (bridgeOff) {
 					if (savedBridge === undefined) delete process.env.CCB_QW_BRIDGE;
 					else process.env.CCB_QW_BRIDGE = savedBridge;
 				}
