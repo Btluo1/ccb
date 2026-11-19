@@ -951,6 +951,25 @@ function toQoderSettings(e) {
 	};
 }
 
+/** 0.5.14+ 新通道：settings.json 顶层 providers.<key>（customProviderManager 从磁盘加载）。
+ *  2026-11-20 逆向 0.5.14 worker 实证：GUI 模型列表只认 settings.providers 注册的自定义
+ *  provider（reloadModelConfigFromDisk → replaceCustomProviderSettings），旧字段
+ *  modelConfigs.customModels 仅剩 CLI 终端对话框读取，桌面版 GUI 不消费——0.5.14 起必须
+ *  双写。schema（SIc 解析器）：models 为对象数组（model 必填）；protocol/authType 缺省即
+ *  openai/bearer；accessMode 默认 'local'，加载路径无权益门禁（门禁只拦 UI 创建操作）。 */
+function toQoderProviders(cfg) {
+	return {
+		displayName: 'CCB',
+		baseUrl: cfg.apiBase.replace(/\/+$/, ''),
+		apiKey: cfg.apiKey,
+		models: cfg.models.map((model) => ({
+			model,
+			displayName: model,
+			contextWindow: QODER_DEFAULT_MAX_INPUT,
+		})),
+	};
+}
+
 const isOursQoder = (m) => m && typeof m.key === 'string' && m.key.startsWith(QODER_KEY_PREFIX);
 
 /** 把默认模型指向我们的模型：改 .models/default 的 key（保留 uid/scene 等原有字段）
@@ -1061,8 +1080,15 @@ function writeQoderSettingsModels(root, cfg, log) {
 	const kept = (Array.isArray(mc.customModels) ? mc.customModels : []).filter((m) => !isOursQoder(m));
 	const entries = qoderEntries(cfg);
 	settings.modelConfigs = { ...mc, customModels: [...kept, ...entries.map(toQoderSettings)] };
+	/* 0.5.14+ 双写：顶层 providers.ccb（GUI 模型列表的真实数据源，见 toQoderProviders 注释）。
+	 * 只替换我们名下的 key，用户自建 provider 原样保留。 */
+	const providers =
+		settings.providers && typeof settings.providers === 'object' && !Array.isArray(settings.providers)
+			? settings.providers
+			: {};
+	settings.providers = { ...providers, ccb: toQoderProviders(cfg) };
 	writeText(settingsPath, JSON.stringify(settings, null, 4));
-	log(`已写入 ${settingsPath}（${entries.length} 个 CCB 模型）`);
+	log(`已写入 ${settingsPath}（${entries.length} 个 CCB 模型，含 0.5.14+ providers 通道）`);
 }
 
 /** 回滚 settings.json：优先还原备份，否则只移除 CCB 条目；返回改动处数 */
@@ -1072,14 +1098,27 @@ function rollbackQoderSettingsModels(root, log) {
 	if (restoreBackup(settingsPath, log)) return 1;
 	try {
 		const settings = JSON.parse(readText(settingsPath));
+		let changed = false;
 		if (settings && settings.modelConfigs && Array.isArray(settings.modelConfigs.customModels)) {
 			const kept = settings.modelConfigs.customModels.filter((m) => !isOursQoder(m));
 			if (kept.length !== settings.modelConfigs.customModels.length) {
 				settings.modelConfigs.customModels = kept;
-				writeText(settingsPath, JSON.stringify(settings, null, 4));
-				log(`已从 ${settingsPath} 移除 CCB 模型`);
-				return 1;
+				changed = true;
 			}
+		}
+		/* 0.5.14+ providers.ccb 一并剥除；providers 因此为空时删除整个字段 */
+		if (settings && settings.providers && typeof settings.providers === 'object' && !Array.isArray(settings.providers)) {
+			if (Object.hasOwn(settings.providers, 'ccb')) {
+				const rest = Object.fromEntries(Object.entries(settings.providers).filter(([k]) => k !== 'ccb'));
+				if (Object.keys(rest).length) settings.providers = rest;
+				else delete settings.providers;
+				changed = true;
+			}
+		}
+		if (changed) {
+			writeText(settingsPath, JSON.stringify(settings, null, 4));
+			log(`已从 ${settingsPath} 移除 CCB 模型`);
+			return 1;
 		}
 	} catch {}
 	return 0;
@@ -2630,6 +2669,7 @@ module.exports = {
 	rollbackConfig,
 	cleanupLegacyKiroEnv,
 	pickDefaultModel,
+	writeQoderSettingsModels,
 	qoderWorkRow,
 	qoderEncrypt,
 	qoderDecrypt,
